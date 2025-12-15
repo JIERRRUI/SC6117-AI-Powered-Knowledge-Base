@@ -1,4 +1,10 @@
-import { Note, ClusterNode } from "../types";
+import {
+  Note,
+  ClusterNode,
+  ClusteringDecision,
+  ClusteringMemory,
+  MemoryBuffer,
+} from "../types";
 import { clusterNotesWithGemini } from "./geminiService";
 
 // Minimal, incremental clustering scaffolding with caching.
@@ -18,6 +24,107 @@ const fastHash = (s: string) => {
 
 const CACHE_KEY = "clusters_cache_v1";
 const HASH_INDEX_KEY = "note_hash_index_v1";
+const MEMORY_KEY = "clustering_memory_v1";
+const MAX_MEMORY_SIZE = 50; // Keep last 50 clustering decisions
+
+// --- Dynamic Memory System Implementation ---
+
+class ClusteringMemoryBuffer implements MemoryBuffer {
+  private memory: ClusteringMemory;
+
+  constructor() {
+    this.memory = this.loadMemory();
+  }
+
+  private loadMemory(): ClusteringMemory {
+    try {
+      const raw = localStorage.getItem(MEMORY_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as ClusteringMemory;
+        // Validate structure
+        if (parsed.decisions && Array.isArray(parsed.decisions)) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to load clustering memory:", e);
+    }
+
+    // Return default empty memory
+    return {
+      decisions: [],
+      lastClusteringTime: 0,
+      totalNotesProcessed: 0,
+      averageConfidence: 0,
+      version: "1.0",
+    };
+  }
+
+  private saveMemory(): void {
+    try {
+      localStorage.setItem(MEMORY_KEY, JSON.stringify(this.memory));
+    } catch (e) {
+      console.warn("Failed to save clustering memory:", e);
+    }
+  }
+
+  addDecision(decision: ClusteringDecision): void {
+    this.memory.decisions.push(decision);
+
+    // Maintain size limit
+    if (this.memory.decisions.length > MAX_MEMORY_SIZE) {
+      this.memory.decisions = this.memory.decisions.slice(-MAX_MEMORY_SIZE);
+    }
+
+    // Update stats
+    this.memory.lastClusteringTime = decision.timestamp;
+    this.memory.totalNotesProcessed += decision.noteIds.length;
+
+    // Recalculate average confidence
+    const confidences = this.memory.decisions.map((d) => d.confidence);
+    this.memory.averageConfidence =
+      confidences.reduce((a, b) => a + b, 0) / confidences.length;
+
+    this.saveMemory();
+  }
+
+  getRecentDecisions(limit: number = 10): ClusteringDecision[] {
+    return this.memory.decisions.slice(-limit);
+  }
+
+  getDecisionById(id: string): ClusteringDecision | null {
+    return this.memory.decisions.find((d) => d.id === id) || null;
+  }
+
+  getMemoryForNotes(noteIds: string[]): ClusteringMemory {
+    const relevantDecisions = this.memory.decisions.filter((decision) =>
+      decision.noteIds.some((id) => noteIds.includes(id))
+    );
+
+    return {
+      ...this.memory,
+      decisions: relevantDecisions,
+    };
+  }
+
+  clearOldDecisions(keepLastN: number = 10): void {
+    if (this.memory.decisions.length > keepLastN) {
+      this.memory.decisions = this.memory.decisions.slice(-keepLastN);
+      this.saveMemory();
+    }
+  }
+
+  getStats() {
+    return {
+      totalDecisions: this.memory.decisions.length,
+      avgConfidence: this.memory.averageConfidence,
+      lastUpdate: this.memory.lastClusteringTime,
+    };
+  }
+}
+
+// Global memory buffer instance
+const memoryBuffer = new ClusteringMemoryBuffer();
 
 export const readCachedClusters = (): ClusterNode[] => {
   try {
