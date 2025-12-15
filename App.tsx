@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Note, SearchMode, SearchResult, ProcessingStatus, ClusterNode } from './types';
 import { clusterNotesWithGemini, semanticSearchWithGemini, correctTextWithGemini } from './services/geminiService';
+import { incrementalCluster, benchmarkClustering } from './services/clusteringService';
 import { getAllNotes, saveNote, deleteNote, bulkSaveNotes } from './services/storageService';
 import { SearchIcon, FileTextIcon, NetworkIcon, ZapIcon, LayersIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, WifiOffIcon, UploadCloudIcon, XIcon, PlusIcon, WandIcon, TrashIcon, SaveIcon } from './components/Icons';
 import ClusterGraph from './components/ClusterGraph';
@@ -409,10 +410,10 @@ const App = () => {
   };
 
   const handleCluster = async () => {
-    if (!isOnline) return;
-    setStatus({ isProcessing: true, message: 'AI is organizing your knowledge base...' });
+    // Allow clustering with cached results even when offline
+    setStatus({ isProcessing: true, message: 'Organizing knowledge (incremental clustering)...' });
     try {
-      const clusterData = await clusterNotesWithGemini(notes);
+      const clusterData = await incrementalCluster(notes);
       setClusters(clusterData);
       setHasClustered(true);
       setViewMode('graph');
@@ -778,6 +779,24 @@ const App = () => {
           >
             <NetworkIcon className="w-3 h-3" />
             {status.isProcessing && !hasClustered ? 'Thinking...' : !isOnline ? 'Offline' : 'Cluster AI'}
+          </button>
+          <button
+            onClick={async () => {
+              setStatus({ isProcessing: true, message: 'Benchmarking clustering...' });
+              try {
+                const res = await benchmarkClustering(1000);
+                alert(`Benchmark: ${res.noteCount} notes clustered in ${res.durationMs} ms`);
+              } catch (e) {
+                console.error(e);
+                alert('Benchmark failed');
+              } finally {
+                setStatus({ isProcessing: false, message: '' });
+              }
+            }}
+            className="flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-white/5 hover:bg-white/10 text-muted"
+            title="Run 1000-note clustering benchmark"
+          >
+            <ZapIcon className="w-3 h-3" /> Benchmark
           </button>
         </div>
 
