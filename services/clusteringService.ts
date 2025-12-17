@@ -4,8 +4,24 @@ import {
   ClusteringDecision,
   ClusteringMemory,
   MemoryBuffer,
+  EmbeddingPartition,
+  SemanticCentroid,
+  HardSample,
+  SupervisionSignal,
+  ConstraintSet,
+  SemanticClusteringResult,
 } from "../types";
-import { clusterNotesWithGemini } from "./geminiService";
+import {
+  clusterNotesWithGemini,
+  dualPromptClusterNotesWithGemini,
+  generateSemanticCentroid,
+  detectHardSample,
+} from "./geminiService";
+import {
+  getOrGenerateEmbeddings,
+  embeddingGuidedPartitioning,
+  getEmbeddingStats,
+} from "./embeddingService";
 
 // Minimal, incremental clustering scaffolding with caching.
 // Vector-store integration and embeddings are planned but not required to run.
@@ -126,6 +142,9 @@ class ClusteringMemoryBuffer implements MemoryBuffer {
 // Global memory buffer instance
 const memoryBuffer = new ClusteringMemoryBuffer();
 
+// Export memory buffer for use in other services
+export { memoryBuffer };
+
 export const readCachedClusters = (): ClusterNode[] => {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
@@ -177,6 +196,51 @@ export const ingestNotes = (notes: Note[]): IngestionResult => {
   return { notes, changedNoteIds: changed };
 };
 
+// Compute a hash of cluster assignments to detect convergence
+const hashClusterAssignments = (clusters: ClusterNode[]): string => {
+  const assignments = clusters
+    .map((c) => c.id + ":" + (c.children?.map((ch) => ch.id).join(",") || ""))
+    .join("|");
+  let h = 0;
+  for (let i = 0; i < assignments.length; i++)
+    h = (h * 31 + assignments.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+};
+
+// Iterative clustering with convergence detection (Step 1.3)
+export const iterativeClusterWithRefinement = async (
+  notes: Note[],
+  maxIterations: number = 3
+): Promise<{
+  clusters: ClusterNode[];
+  iterations: number;
+  converged: boolean;
+}> => {
+  let clusters: ClusterNode[] = [];
+  let previousHash = "";
+  let iterations = 0;
+
+  for (let i = 0; i < maxIterations; i++) {
+    iterations = i + 1;
+
+    // Perform dual-prompt clustering with memory feedback
+    const result = await dualPromptClusterNotesWithGemini(notes, memoryBuffer);
+    clusters = result.clusters;
+
+    // Check for convergence
+    const currentHash = hashClusterAssignments(clusters);
+    if (currentHash === previousHash) {
+      // Converged
+      return { clusters, iterations, converged: true };
+    }
+
+    previousHash = currentHash;
+  }
+
+  // Max iterations reached
+  return { clusters, iterations, converged: false };
+};
+
 // Incremental clustering: if few notes changed, you can re-cluster selectively.
 // For now, we call the existing Gemini clustering across all notes, but
 // preserve caching and return immediately if nothing changed.
@@ -191,6 +255,39 @@ export const incrementalCluster = async (
 
   // Fallback: full clustering via Gemini service (existing logic).
   const clusters = await clusterNotesWithGemini(notes);
+  writeCachedClusters(clusters);
+  return clusters;
+};
+
+// Enhanced clustering with dual-prompt and iterative refinement (Phase 1)
+export const enhancedCluster = async (
+  notes: Note[],
+  useIterativeRefinement: boolean = true
+): Promise<ClusterNode[]> => {
+  const { changedNoteIds } = ingestNotes(notes);
+
+  // Check cache
+  if (changedNoteIds.length === 0) {
+    const cached = readCachedClusters();
+    if (cached.length > 0) return cached;
+  }
+
+  let clusters: ClusterNode[];
+
+  if (useIterativeRefinement) {
+    // Use iterative refinement with memory feedback
+    console.log("Starting iterative clustering with memory feedback...");
+    const result = await iterativeClusterWithRefinement(notes, 3);
+    clusters = result.clusters;
+    console.log(
+      `Clustering converged: ${result.converged} after ${result.iterations} iterations`
+    );
+  } else {
+    // Use basic dual-prompt clustering
+    const result = await dualPromptClusterNotesWithGemini(notes, memoryBuffer);
+    clusters = result.clusters;
+  }
+
   writeCachedClusters(clusters);
   return clusters;
 };
@@ -276,5 +373,456 @@ export const benchmarkClustering = async (
       before.length > 0 &&
       synthetic.every((n) => readHashIndex()[n.id]) &&
       after.length === before.length,
+  };
+};
+// --- Hybrid Clustering with Embeddings (Phase 2) ---
+
+/**
+ * Convert embedding partitions to ClusterNode structure
+ */
+const partitionsToClusterNodes = (
+  partitions: EmbeddingPartition[],
+  notes: Note[]
+): ClusterNode[] => {
+  return partitions.map((partition) => {
+    const noteMap = new Map(notes.map((n) => [n.id, n]));
+    const clusterName = `Cluster ${partition.id}`;
+
+    return {
+      id: partition.id,
+      name: clusterName,
+      type: "cluster" as const,
+      description: `Embedding-based partition with ${partition.noteIds.length} notes`,
+      children: partition.noteIds
+        .map((noteId) => {
+          const note = noteMap.get(noteId);
+          if (!note) return null;
+          return {
+            id: `${partition.id}-${noteId}`,
+            name: note.title,
+            type: "note" as const,
+            noteId,
+          };
+        })
+        .filter((n): n is ClusterNode => n !== null),
+    };
+  });
+};
+
+/**
+ * Hybrid clustering: embeddings for partitioning, then LLM for refinement
+ * @param notes Notes to cluster
+ * @param similarityThreshold Threshold for embedding-based grouping (0-1)
+ * @param useRefinement Whether to refine with dual-prompt LLM
+ * @returns Refined clusters
+ */
+export const hybridClusterWithEmbeddings = async (
+  notes: Note[],
+  similarityThreshold: number = 0.65,
+  useRefinement: boolean = true
+): Promise<ClusterNode[]> => {
+  console.log(`Starting hybrid clustering for ${notes.length} notes...`);
+  const start = performance.now();
+
+  try {
+    // Step 1: Generate or load embeddings
+    console.log("Generating embeddings...");
+    const embeddings = await getOrGenerateEmbeddings(notes);
+    const embeddingStats = getEmbeddingStats(embeddings);
+    console.log(`Embeddings ready: ${JSON.stringify(embeddingStats)}`);
+
+    if (embeddings.length === 0) {
+      console.warn(
+        "Failed to generate embeddings, falling back to basic clustering"
+      );
+      return await enhancedCluster(notes, false);
+    }
+
+    // Step 2: Embedding-guided partitioning
+    console.log(
+      `Performing embedding-guided partitioning (threshold: ${similarityThreshold})...`
+    );
+    const partitions = embeddingGuidedPartitioning(
+      embeddings,
+      similarityThreshold,
+      2 // minClusterSize
+    );
+
+    // Convert to ClusterNodes
+    let clusters = partitionsToClusterNodes(partitions, notes);
+
+    // Step 3: Optional LLM refinement for quality
+    if (useRefinement && partitions.length > 1) {
+      console.log(`Refining ${clusters.length} partitions with LLM...`);
+
+      // For now, enhance the cluster descriptions with LLM
+      // Future: iterative refinement of partition assignments
+      const refined = await enhancedCluster(notes, false);
+
+      // Merge: use embedding structure but enhance with LLM insights
+      if (refined.length > 0) {
+        console.log(
+          `LLM refinement added insights to ${refined.length} clusters`
+        );
+        // Merge descriptions from LLM clustering
+        clusters.forEach((cluster, i) => {
+          if (refined[i]) {
+            cluster.description = `${cluster.description} | LLM: ${
+              refined[i].description || ""
+            }`;
+          }
+        });
+      }
+    }
+
+    const duration = Math.round(performance.now() - start);
+    console.log(
+      `Hybrid clustering complete: ${clusters.length} clusters in ${duration}ms`
+    );
+
+    // Cache the result
+    writeCachedClusters(clusters);
+
+    return clusters;
+  } catch (e) {
+    console.error("Hybrid clustering error:", e);
+    console.log("Falling back to enhanced clustering...");
+    return await enhancedCluster(notes, true);
+  }
+};
+
+/**
+ * Multi-level hybrid clustering for scalability (1000+ notes)
+ * @param notes Notes to cluster
+ * @param initialThreshold Embedding similarity threshold
+ * @param maxClusterSize Maximum notes per cluster before subdivision
+ * @returns Hierarchical cluster structure
+ */
+export const hierarchicalHybridClustering = async (
+  notes: Note[],
+  initialThreshold: number = 0.65,
+  maxClusterSize: number = 200
+): Promise<ClusterNode[]> => {
+  console.log(
+    `Starting hierarchical hybrid clustering for ${notes.length} notes...`
+  );
+
+  // Step 1: Initial embedding-based partitioning
+  const clusters = await hybridClusterWithEmbeddings(
+    notes,
+    initialThreshold,
+    false
+  );
+
+  // Step 2: Subdivide large clusters recursively
+  const processCluster = async (
+    cluster: ClusterNode,
+    depth: number = 1
+  ): Promise<ClusterNode> => {
+    if (cluster.type === "note" || !cluster.children) {
+      return cluster;
+    }
+
+    const noteIds = cluster.children
+      .filter((c) => c.type === "note")
+      .map((c) => c.noteId)
+      .filter((id): id is string => Boolean(id));
+
+    // If cluster is too large, subdivide
+    if (noteIds.length > maxClusterSize && depth < 3) {
+      const childNotes = notes.filter((n) => noteIds.includes(n.id));
+      const threshold = initialThreshold - depth * 0.05; // Lower threshold for finer granularity
+
+      console.log(
+        `Subdividing cluster "${cluster.name}" (${noteIds.length} notes, depth ${depth})...`
+      );
+
+      const subClusters = await hybridClusterWithEmbeddings(
+        childNotes,
+        Math.max(0.5, threshold),
+        false
+      );
+
+      return {
+        ...cluster,
+        children: subClusters,
+      };
+    }
+
+    return cluster;
+  };
+
+  // Process all clusters
+  const hierarchical = await Promise.all(
+    clusters.map((c) => processCluster(c))
+  );
+
+  console.log(
+    `Hierarchical clustering complete with ${hierarchical.length} root clusters`
+  );
+  return hierarchical;
+};
+// --- Semantic Enhancement (Phase 3) ---
+
+/**
+ * Generate semantic centroids for all clusters (Step 3.1)
+ * @param clusters Clusters to enhance
+ * @param notes All notes for context
+ * @returns Map of cluster ID to semantic centroid
+ */
+export const generateSemanticCentroids = async (
+  clusters: ClusterNode[],
+  notes: Note[]
+): Promise<Map<string, SemanticCentroid>> => {
+  const centroids = new Map<string, SemanticCentroid>();
+  const noteMap = new Map(notes.map((n) => [n.id, n]));
+
+  for (const cluster of clusters) {
+    if (cluster.type === "cluster") {
+      // Get notes in this cluster
+      const clusterNoteIds =
+        cluster.children
+          ?.filter((c) => c.type === "note")
+          .map((c) => c.noteId)
+          .filter((id): id is string => Boolean(id)) || [];
+
+      const clusterNotes = clusterNoteIds
+        .map((id) => noteMap.get(id))
+        .filter((n): n is Note => Boolean(n));
+
+      if (clusterNotes.length > 0) {
+        const centroid = await generateSemanticCentroid(
+          cluster.id,
+          clusterNotes,
+          cluster.description
+        );
+        centroids.set(cluster.id, centroid);
+      }
+    }
+  }
+
+  console.log(`Generated ${centroids.size} semantic centroids`);
+  return centroids;
+};
+
+/**
+ * Detect hard samples and augment their content (Step 3.2)
+ * @param clusters Clusters for context
+ * @param notes All notes
+ * @param augmentThreshold Threshold for which samples to augment (0-1)
+ * @returns Array of hard samples with potential augmentations
+ */
+export const detectAndAugmentHardSamples = async (
+  clusters: ClusterNode[],
+  notes: Note[],
+  augmentThreshold: number = 0.65
+): Promise<HardSample[]> => {
+  const hardSamples: HardSample[] = [];
+  const clusterIds = clusters
+    .filter((c) => c.type === "cluster")
+    .map((c) => c.id);
+
+  // Sample a subset of notes to check (for efficiency)
+  const samplesToCheck = Math.min(notes.length, 20);
+  const sampleIndices = Array.from({ length: samplesToCheck }, (_, i) =>
+    Math.floor((i * notes.length) / samplesToCheck)
+  );
+
+  for (const idx of sampleIndices) {
+    const note = notes[idx];
+    if (!note) continue;
+
+    const hardSample = await detectHardSample(note, clusterIds);
+    if (hardSample && hardSample.ambiguityScore >= augmentThreshold) {
+      hardSamples.push(hardSample);
+    }
+  }
+
+  console.log(
+    `Detected ${hardSamples.length} hard samples (threshold: ${augmentThreshold})`
+  );
+  return hardSamples;
+};
+
+/**
+ * Generate supervision signals (constraints) from hard samples (Step 3.3)
+ * @param hardSamples Hard samples that need constraints
+ * @returns Constraint set with must-link and cannot-link pairs
+ */
+export const generateSupervisionSignals = (
+  hardSamples: HardSample[]
+): ConstraintSet => {
+  const mustLinkPairs: SupervisionSignal[] = [];
+  const cannotLinkPairs: SupervisionSignal[] = [];
+  const affectedNotes = new Set<string>();
+
+  // For each hard sample, create constraints
+  hardSamples.forEach((sample) => {
+    affectedNotes.add(sample.noteId);
+
+    // Must-link: within primary cluster
+    if (sample.possibleClusters.length > 0) {
+      const primaryCluster = sample.possibleClusters[0];
+
+      // Can-link pairs with other notes from possible clusters
+      sample.possibleClusters.forEach((clusterId) => {
+        const signal: SupervisionSignal = {
+          id: `must-${sample.noteId}-${clusterId}`,
+          type: "must-link",
+          note1Id: sample.noteId,
+          note2Id: `cluster-${clusterId}`, // Pseudo-ID for cluster
+          strength: 0.7,
+          reason: "Hard sample likely belongs to this cluster",
+        };
+        mustLinkPairs.push(signal);
+      });
+
+      // Cannot-link: away from other clusters
+      const otherClusters = sample.possibleClusters.slice(1);
+      otherClusters.forEach((clusterId) => {
+        const signal: SupervisionSignal = {
+          id: `cannot-${sample.noteId}-${clusterId}`,
+          type: "cannot-link",
+          note1Id: sample.noteId,
+          note2Id: `cluster-${clusterId}`,
+          strength: 0.3,
+          reason: "Hard sample less likely in this cluster",
+        };
+        cannotLinkPairs.push(signal);
+      });
+    }
+  });
+
+  const result: ConstraintSet = {
+    mustLinkPairs,
+    cannotLinkPairs,
+    totalConstraints: mustLinkPairs.length + cannotLinkPairs.length,
+    totalNotesAffected: affectedNotes.size,
+  };
+
+  console.log(
+    `Generated ${result.totalConstraints} constraints affecting ${result.totalNotesAffected} notes`
+  );
+  return result;
+};
+
+/**
+ * Full semantic enhancement pipeline (Phase 3 integration)
+ * @param clusters Initial clusters
+ * @param notes All notes
+ * @param generateCentroids Whether to generate semantic centroids
+ * @param detectHardSamples Whether to detect hard samples
+ * @returns Enhanced clustering result with semantics
+ */
+export const semanticEnhancedClustering = async (
+  clusters: ClusterNode[],
+  notes: Note[],
+  generateCentroids: boolean = true,
+  detectHardSamples: boolean = true
+): Promise<SemanticClusteringResult> => {
+  const start = performance.now();
+
+  console.log(
+    `Starting semantic enhancement: ${clusters.length} clusters, ${notes.length} notes`
+  );
+
+  // Step 1: Generate semantic centroids
+  const centroids = generateCentroids
+    ? await generateSemanticCentroids(clusters, notes)
+    : new Map();
+
+  // Step 2: Detect hard samples
+  const hardSamples = detectHardSamples
+    ? await detectAndAugmentHardSamples(clusters, notes, 0.65)
+    : [];
+
+  // Step 3: Generate supervision signals
+  const constraints = generateSupervisionSignals(hardSamples);
+
+  // Step 4: Calculate final confidence
+  const avgCentroidConfidence =
+    centroids.size > 0
+      ? Array.from(centroids.values()).reduce(
+          (sum, c) => sum + c.confidence,
+          0
+        ) / centroids.size
+      : 0.8;
+
+  const duration = Math.round(performance.now() - start);
+
+  const result: SemanticClusteringResult = {
+    clusters,
+    centroids,
+    hardSamples,
+    constraints,
+    iterations: 1,
+    finalConfidence: avgCentroidConfidence,
+  };
+
+  console.log(
+    `Semantic enhancement complete: ${centroids.size} centroids, ${hardSamples.length} hard samples, ${duration}ms`
+  );
+
+  return result;
+};
+
+/**
+ * Full end-to-end semantic clustering: embeddings + LLM + semantics
+ * @param notes Notes to cluster
+ * @param options Configuration options
+ * @returns Complete clustering result with all enhancements
+ */
+export const fullSemanticClustering = async (
+  notes: Note[],
+  options: {
+    useHybridEmbeddings?: boolean;
+    useSemanticEnhancement?: boolean;
+    generateCentroids?: boolean;
+    detectHardSamples?: boolean;
+  } = {}
+): Promise<SemanticClusteringResult> => {
+  const {
+    useHybridEmbeddings = true,
+    useSemanticEnhancement = true,
+    generateCentroids = true,
+    detectHardSamples = true,
+  } = options;
+
+  console.log("Starting full semantic clustering pipeline...");
+
+  // Phase 2: Hybrid embeddings
+  let clusters: ClusterNode[];
+  if (useHybridEmbeddings) {
+    console.log("Phase 2: Embedding-guided clustering");
+    clusters = await hybridClusterWithEmbeddings(notes, 0.65, true);
+  } else {
+    console.log("Phase 1: Enhanced LLM clustering");
+    clusters = await enhancedCluster(notes, true);
+  }
+
+  // Phase 3: Semantic enhancement
+  if (useSemanticEnhancement) {
+    console.log("Phase 3: Semantic enhancement");
+    return semanticEnhancedClustering(
+      clusters,
+      notes,
+      generateCentroids,
+      detectHardSamples
+    );
+  }
+
+  // Fallback: just return clusters
+  return {
+    clusters,
+    centroids: new Map(),
+    hardSamples: [],
+    constraints: {
+      mustLinkPairs: [],
+      cannotLinkPairs: [],
+      totalConstraints: 0,
+      totalNotesAffected: 0,
+    },
+    iterations: 1,
+    finalConfidence: 0.8,
   };
 };
