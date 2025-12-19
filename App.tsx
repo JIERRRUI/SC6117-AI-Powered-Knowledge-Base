@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Note, SearchMode, SearchResult, ProcessingStatus, ClusterNode } from './types';
 import { clusterNotesWithGemini, semanticSearchWithGemini, correctTextWithGemini } from './services/geminiService';
-import { incrementalCluster, benchmarkClustering } from './services/clusteringService';
+import { incrementalCluster, benchmarkClustering, fullSemanticClustering } from './services/clusteringService';
 import { getAllNotes, saveNote, deleteNote, bulkSaveNotes } from './services/storageService';
 import { SearchIcon, FileTextIcon, NetworkIcon, ZapIcon, LayersIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, WifiOffIcon, UploadCloudIcon, XIcon, PlusIcon, WandIcon, TrashIcon, SaveIcon } from './components/Icons';
 import ClusterGraph from './components/ClusterGraph';
@@ -240,6 +240,8 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
         <button 
           onClick={onClose}
           className="absolute top-4 right-4 text-muted hover:text-white transition-colors"
+          title="Close import dialog"
+          aria-label="Close import dialog"
         >
           <XIcon className="w-5 h-5" />
         </button>
@@ -268,6 +270,8 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
               className="hidden" 
               multiple 
               accept=".md,.txt,.markdown,.html,.htm,.one"
+              aria-label="Upload notes files"
+              title="Upload notes files"
               onChange={(e) => {
                 if (e.target.files) onUpload(e.target.files);
               }}
@@ -302,6 +306,25 @@ const App = () => {
   // Clustering State
   const [clusters, setClusters] = useState<ClusterNode[]>([]);
   const [hasClustered, setHasClustered] = useState(false);
+
+  // Clear all clustering caches on page load for fresh start
+  useEffect(() => {
+    const clearClusteringCaches = () => {
+      console.log('🧹 Clearing all clustering caches for fresh start...');
+      const keysToRemove = [
+        'clusters_cache_v1',
+        'note_hash_index_v1',
+        'clustering_memory_v1',
+        'embedding_index_v1'
+      ];
+      keysToRemove.forEach(key => {
+        localStorage.removeItem(key);
+        console.log(`  Removed: ${key}`);
+      });
+      console.log('✅ All caches cleared');
+    };
+    clearClusteringCaches();
+  }, []);
 
   // Folders State for Sidebar
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
@@ -410,16 +433,30 @@ const App = () => {
   };
 
   const handleCluster = async () => {
-    // Allow clustering with cached results even when offline
-    setStatus({ isProcessing: true, message: 'Organizing knowledge (incremental clustering)...' });
+    // Use full semantic clustering pipeline for best results
+    setStatus({ isProcessing: true, message: 'Running full semantic clustering pipeline...' });
     try {
-      const clusterData = await incrementalCluster(notes);
-      setClusters(clusterData);
+      console.log('🚀 Starting fullSemanticClustering with', notes.length, 'notes');
+      const result = await fullSemanticClustering(notes, {
+        useHybridEmbeddings: true,
+        useSemanticEnhancement: true,
+        generateCentroids: true,
+        detectHardSamples: true,
+      });
+      
+      console.log(`✅ Clustering complete:`, {
+        clusters: result.clusters.length,
+        centroids: result.centroids.size,
+        hardSamples: result.hardSamples.length,
+        confidence: result.finalConfidence.toFixed(2),
+      });
+      
+      setClusters(result.clusters);
       setHasClustered(true);
       setViewMode('graph');
     } catch (e) {
-      console.error(e);
-      alert('Clustering failed');
+      console.error('Clustering failed:', e);
+      alert('Clustering failed. Check console for details.');
     } finally {
       setStatus({ isProcessing: false, message: '' });
     }
@@ -725,7 +762,7 @@ const App = () => {
 
   return (
     <div className="flex h-screen w-full bg-background text-text overflow-hidden">
-      
+
       <UploadModal 
         isOpen={isUploadModalOpen} 
         onClose={() => setIsUploadModalOpen(false)} 

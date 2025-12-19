@@ -1,12 +1,248 @@
 import { ClusteringDecision, MemoryBuffer } from "../types";
 import { memoryBuffer as globalMemoryBuffer } from "./clusteringService";
-// --- Dual-Prompt Clustering Logic ---
+import { GoogleGenAI, Type } from "@google/genai";
+import { Note, ClusterNode, SearchResult } from "../types";
+import { SemanticCentroid, HardSample } from "../types";
+
+// ⚙️ CONFIGURATION
+const CONFIG = {
+  // Model selection: "gemini-2.5-flash-lite" | "gemini-2.5-flash" | "gemini-2.5-pro" | "gemini-3-pro"
+  modelName: "gemini-2.5-flash-lite" as const,
+};
+
+const getAIClient = () => {
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) {
+    throw new Error("API Key not found");
+  }
+  return new GoogleGenAI({ apiKey });
+};
+
+// Helper to extract text from GenAI response
+const extractResponseText = (response: any): string => {
+  if (!response) {
+    console.warn("❌ Response is null/undefined");
+    return "";
+  }
+
+  // Log response structure for debugging
+  console.log("📦 Response type:", typeof response);
+
+  // Try direct text property first
+  if (typeof response.text === "string") {
+    console.log(
+      "✅ Found text as string property. response.text",
+      response.text
+    );
+    return response.text;
+  }
+
+  // Try text() method
+  if (typeof response.text === "function") {
+    console.log("✅ Found text as function, calling it...");
+    const result = response.text();
+    console.log(
+      "✅ text() returned:",
+      typeof result,
+      result?.substring?.(0, 100)
+    );
+    return result || "";
+  }
+
+  // Try candidates array (standard Gemini API response)
+  if (response.candidates?.[0]?.content?.parts?.[0]?.text) {
+    console.log("✅ Found text in candidates array");
+    return response.candidates[0].content.parts[0].text;
+  }
+
+  console.warn("❌ Could not extract text from response:", response);
+  console.log(
+    "📦 Response content:",
+    JSON.stringify(response).substring(0, 500)
+  );
+  return "";
+};
+
 /**
- * Performs dual-prompt clustering: initial rough grouping, then refinement with memory feedback.
- * @param notes Notes to cluster
- * @param memory Optional memory buffer (defaults to global buffer)
- * @returns Refined clusters and clustering decision metadata
+ * Generate semantic cluster names with enhanced context
+ * Used during Phase 3 semantic enhancement
  */
+export const generateSemanticClusterName = async (
+  notes: Note[],
+  centroid?: SemanticCentroid
+): Promise<{ name: string; description: string }> => {
+  if (notes.length === 0) {
+    return { name: "Empty Cluster", description: "No notes" };
+  }
+
+  const ai = getAIClient();
+  const notesPreview = notes.map((n) => ({
+    title: n.title,
+    contentSnippet: n.content.substring(0, 150),
+  }));
+
+  let semanticContext = "";
+  if (centroid) {
+    const keywords = centroid.keywords?.join(", ") || "";
+    semanticContext = `
+Semantic analysis found these themes:
+- Description: ${centroid.description || ""}
+- Keywords: ${keywords}`;
+  }
+
+  const prompt = `
+You are a knowledge organization expert.
+
+Analyze these ${notes.length} notes and provide a meaningful cluster name.
+${semanticContext}
+
+RULES:
+1. The name MUST be a clear, descriptive topic (2-4 words)
+2. Focus on the core subject matter that unifies these notes
+3. NEVER use generic names like "Miscellaneous", "Topic Group", "Cluster", "Other", or "Uncategorized"
+4. If notes are diverse, find the broadest common theme
+
+Example good names: "Machine Learning", "Web Development", "Cooking Recipes", "Personal Finance"
+Example bad names: "Cluster 1", "Misc Notes", "Topic Group", "Various Topics"
+
+Notes:
+${JSON.stringify(notesPreview, null, 2)}
+
+Return JSON with "name" (2-4 word topic) and "description" (1 sentence).`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: CONFIG.modelName,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            description: { type: Type.STRING },
+          },
+          required: ["name", "description"],
+        },
+      },
+    });
+
+    const text = extractResponseText(response);
+    if (!text) {
+      console.warn("No text from semantic cluster naming LLM, using fallback");
+      return {
+        name: centroid?.description || `Topic Group (${notes.length} notes)`,
+        description:
+          centroid?.description ||
+          notes
+            .map((n) => n.title)
+            .slice(0, 2)
+            .join(", "),
+      };
+    }
+
+    const parsed = JSON.parse(text);
+    return {
+      name: parsed.name || centroid?.description || `Topic Group`,
+      description:
+        parsed.description || centroid?.description || "Related notes",
+    };
+  } catch (e) {
+    console.error("Error generating semantic cluster name:", e);
+    return {
+      name: centroid?.description || `Topic Group (${notes.length} notes)`,
+      description:
+        centroid?.description ||
+        notes
+          .map((n) => n.title)
+          .slice(0, 3)
+          .join(", "),
+    };
+  }
+};
+
+// --- Generate Cluster Name for a Specific Group (for Embedding Partitions) ---
+
+/**
+ * Generate a meaningful name and description for a specific group of notes
+ * Used by embedding-based partitioning to name each partition
+ */
+export const generateClusterName = async (
+  notes: Note[]
+): Promise<{ name: string; description: string }> => {
+  if (notes.length === 0) {
+    return { name: "Empty Cluster", description: "No notes" };
+  }
+
+  const ai = getAIClient();
+  const notesPreview = notes.map((n) => ({
+    title: n.title,
+    contentSnippet: n.content.substring(0, 150),
+  }));
+
+  const prompt = `
+You are a knowledge organization expert.
+
+Analyze these ${notes.length} notes and provide a meaningful cluster name.
+
+RULES:
+1. The name should be a clear, descriptive topic (2-4 words)
+2. Focus on the core subject matter that unifies these notes
+3. NEVER use generic names like "Miscellaneous", "Topic Group", "Cluster", or "Other"
+
+Example good names: "Machine Learning", "React Development", "Italian Cooking", "Project Planning"
+Example bad names: "Cluster 1", "Misc Notes", "Topic Group", "Various Topics"
+
+Notes:
+${JSON.stringify(notesPreview, null, 2)}
+
+Return JSON with "name" (2-4 word topic) and "description" (1 sentence explaining the theme).`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: CONFIG.modelName,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            description: { type: Type.STRING },
+          },
+          required: ["name", "description"],
+        },
+      },
+    });
+
+    const text = extractResponseText(response);
+    if (!text) {
+      console.warn("No text from cluster naming LLM, using fallback");
+      return {
+        name: `Topic Group (${notes.length} notes)`,
+        description: notes.map((n) => n.title).join(", "),
+      };
+    }
+
+    const parsed = JSON.parse(text);
+    return {
+      name: parsed.name || `Topic Group`,
+      description: parsed.description || "Related notes",
+    };
+  } catch (e) {
+    console.error("Error generating cluster name:", e);
+    return {
+      name: `Topic Group (${notes.length} notes)`,
+      description: notes
+        .map((n) => n.title)
+        .slice(0, 3)
+        .join(", "),
+    };
+  }
+};
+
+// --- Dual-Prompt Clustering Logic (Phase 1.2) ---
+
 export const dualPromptClusterNotesWithGemini = async (
   notes: Note[],
   memory: MemoryBuffer = globalMemoryBuffer
@@ -21,17 +257,29 @@ export const dualPromptClusterNotesWithGemini = async (
 
   // 1. Initial prompt for rough grouping and cluster count estimation
   const initialPrompt = `
-    You are an expert knowledge manager.
-    Analyze the following notes and group them into rough high-level clusters.
-    Estimate the optimal number of clusters based on content themes.
-    Return a JSON array of clusters, each with a name, description, and assigned note IDs.
-    
-    Notes:
-    ${JSON.stringify(notesLite)}
+You are an expert knowledge organizer specializing in semantic categorization.
+
+Analyze these notes and group them into meaningful thematic clusters. 
+
+IMPORTANT RULES:
+1. Create 2-5 clusters maximum (prefer fewer, broader categories)
+2. Each cluster name should be a clear, descriptive topic (2-4 words)
+3. Group notes by their core subject matter, not surface-level keywords
+4. Every note MUST be assigned to exactly one cluster
+5. Prefer semantic similarity over exact keyword matching
+
+Example good cluster names: "Machine Learning", "Web Development", "Cooking Recipes", "Project Management"
+Example bad cluster names: "Cluster 1", "Topic Group"
+
+Notes to cluster:
+${JSON.stringify(notesLite, null, 2)}
+
+Return a JSON array where each cluster has: id, name, description, noteIds (array of note IDs in this cluster)
   `;
 
+  console.log("🚀 Calling Gemini API for initial clustering...");
   const initialResponse = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: CONFIG.modelName,
     contents: initialPrompt,
     config: {
       responseMimeType: "application/json",
@@ -58,9 +306,17 @@ export const dualPromptClusterNotesWithGemini = async (
     noteIds: string[];
   }> = [];
   try {
-    initialClusters = JSON.parse(initialResponse.text || "[]");
+    const responseText = extractResponseText(initialResponse);
+    initialClusters = JSON.parse(responseText || "[]");
+    //print for debugging
+    console.log("Initial Clusters:", initialClusters);
   } catch (e) {
-    console.error("Initial clustering parse error", e);
+    console.error(
+      "Initial clustering parse error",
+      e,
+      "Response:",
+      initialResponse
+    );
     initialClusters = [];
   }
 
@@ -92,8 +348,9 @@ export const dualPromptClusterNotesWithGemini = async (
     ${JSON.stringify(notesLite)}
   `;
 
+  console.log("🚀 Calling Gemini API for refinement clustering...");
   const refinementResponse = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: CONFIG.modelName,
     contents: refinementPrompt,
     config: {
       systemInstruction:
@@ -130,9 +387,17 @@ export const dualPromptClusterNotesWithGemini = async (
 
   let clusters: ClusterNode[] = [];
   try {
-    clusters = JSON.parse(refinementResponse.text || "[]");
+    const responseText = extractResponseText(refinementResponse);
+    clusters = JSON.parse(responseText || "[]");
+    //print for debugging
+    console.log("Refined Clusters:", clusters);
   } catch (e) {
-    console.error("Refinement clustering parse error", e);
+    console.error(
+      "Refinement clustering parse error",
+      e,
+      "Response:",
+      refinementResponse
+    );
     clusters = [];
   }
 
@@ -153,24 +418,16 @@ export const dualPromptClusterNotesWithGemini = async (
     noteIds: notes.map((n) => n.id),
     clusterAssignments,
     clusterDescriptions,
-    confidence: 0.9, // Placeholder, could be estimated from LLM output
+    confidence: 0.9,
     method: "refinement",
   };
+  //print for debugging
+  console.log("Clustering Decision:", decision);
 
   // 5. Persist decision in memory buffer
   memory.addDecision(decision);
 
   return { clusters, decision };
-};
-import { GoogleGenAI, Type } from "@google/genai";
-import { Note, ClusterNode, SearchResult } from "../types";
-
-const getAIClient = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-    throw new Error("API Key not found");
-  }
-  return new GoogleGenAI({ apiKey });
 };
 
 // --- Auto-Clustering Logic ---
@@ -180,11 +437,10 @@ export const clusterNotesWithGemini = async (
 ): Promise<ClusterNode[]> => {
   const ai = getAIClient();
 
-  // Prepare a lightweight representation of notes to save tokens
   const notesLite = notes.map((n) => ({
     id: n.id,
     title: n.title,
-    contentSnippet: n.content.substring(0, 200), // Only send first 200 chars
+    contentSnippet: n.content.substring(0, 200),
     tags: n.tags,
   }));
 
@@ -198,9 +454,8 @@ export const clusterNotesWithGemini = async (
     ${JSON.stringify(notesLite)}
   `;
 
-  // We define a schema for the tree structure
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: CONFIG.modelName,
     contents: prompt,
     config: {
       systemInstruction:
@@ -221,9 +476,9 @@ export const clusterNotesWithGemini = async (
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING },
-                  name: { type: Type.STRING }, // Note title
+                  name: { type: Type.STRING },
                   type: { type: Type.STRING, enum: ["note"] },
-                  noteId: { type: Type.STRING }, // Reference to original note ID
+                  noteId: { type: Type.STRING },
                 },
                 required: ["id", "name", "type", "noteId"],
               },
@@ -235,7 +490,7 @@ export const clusterNotesWithGemini = async (
     },
   });
 
-  const jsonStr = response.text || "[]";
+  const jsonStr = extractResponseText(response) || "[]";
   try {
     return JSON.parse(jsonStr) as ClusterNode[];
   } catch (e) {
@@ -271,7 +526,7 @@ export const semanticSearchWithGemini = async (
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: CONFIG.modelName,
     contents: prompt,
     config: {
       responseMimeType: "application/json",
@@ -290,7 +545,7 @@ export const semanticSearchWithGemini = async (
     },
   });
 
-  const jsonStr = response.text || "[]";
+  const jsonStr = extractResponseText(response) || "[]";
   try {
     const rawResults = JSON.parse(jsonStr) as {
       noteId: string;
@@ -298,7 +553,6 @@ export const semanticSearchWithGemini = async (
       reason: string;
     }[];
 
-    // Merge back with full note objects
     const results: SearchResult[] = rawResults
       .map((r): SearchResult | null => {
         const fullNote = notes.find((n) => n.id === r.noteId);
@@ -335,23 +589,15 @@ export const correctTextWithGemini = async (text: string): Promise<string> => {
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: CONFIG.modelName,
     contents: prompt,
   });
 
-  return response.text?.trim() || text;
+  return extractResponseText(response)?.trim() || text;
 };
+
 // --- Semantic Centroid Generation (Phase 3, Step 3.1) ---
 
-import { SemanticCentroid, HardSample } from "../types";
-
-/**
- * Generate semantic descriptions for cluster centroids
- * @param clusterId Cluster ID
- * @param clusterNotes Notes in the cluster
- * @param description Existing cluster description (optional)
- * @returns Semantic centroid with LLM-generated insights
- */
 export const generateSemanticCentroid = async (
   clusterId: string,
   clusterNotes: Note[],
@@ -359,12 +605,15 @@ export const generateSemanticCentroid = async (
 ): Promise<SemanticCentroid> => {
   const ai = getAIClient();
 
-  // Prepare cluster summary
   const notesSummary = clusterNotes
-    .slice(0, 5) // Limit to first 5 notes for context
+    .slice(0, 5)
     .map((n) => `- ${n.title}: ${n.content.substring(0, 100)}...`)
     .join("\n");
 
+  //print for debugging
+  console.log(
+    `Generating semantic centroid for cluster ${clusterId} with ${clusterNotes.length} notes.`
+  );
   const prompt = `
     You are a knowledge organizer expert.
     Analyze this cluster of notes and provide a semantic description.
@@ -384,7 +633,7 @@ export const generateSemanticCentroid = async (
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: CONFIG.modelName,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -400,7 +649,7 @@ export const generateSemanticCentroid = async (
       },
     });
 
-    const result = JSON.parse(response.text || "{}") as {
+    const result = JSON.parse(extractResponseText(response) || "{}") as {
       description: string;
       keywords: string[];
       confidence: number;
@@ -417,6 +666,8 @@ export const generateSemanticCentroid = async (
     console.log(
       `Generated semantic centroid for ${clusterId}: ${centroid.description}`
     );
+    //print for debugging
+    console.log("Centroid details:", centroid);
     return centroid;
   } catch (e) {
     console.error("Failed to generate semantic centroid:", e);
@@ -430,12 +681,8 @@ export const generateSemanticCentroid = async (
   }
 };
 
-/**
- * Detect ambiguous/hard samples that could belong to multiple clusters
- * @param note Note to analyze
- * @param clusterIds Possible cluster IDs
- * @returns Hard sample analysis
- */
+// --- Hard Sample Detection (Phase 3, Step 3.2) ---
+
 export const detectHardSample = async (
   note: Note,
   clusterIds: string[]
@@ -460,7 +707,7 @@ export const detectHardSample = async (
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: CONFIG.modelName,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -480,9 +727,8 @@ export const detectHardSample = async (
       },
     });
 
-    const result = JSON.parse(response.text || "{}");
+    const result = JSON.parse(extractResponseText(response) || "{}");
 
-    // Only flag as hard sample if ambiguous
     if (result.ambiguityScore > 0.6) {
       const hardSample: HardSample = {
         noteId: note.id,
@@ -493,6 +739,8 @@ export const detectHardSample = async (
         rewriteReason: result.shouldAugment ? "High ambiguity" : undefined,
       };
 
+      //print for debugging
+      console.log("Hard sample details:", hardSample);
       console.log(
         `Detected hard sample: ${
           note.id

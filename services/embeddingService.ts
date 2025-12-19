@@ -18,7 +18,8 @@ const getAIClient = () => {
 // --- Embedding Cache Management ---
 
 const EMBEDDING_CACHE_KEY = "embedding_index_v1";
-const EMBEDDING_MODEL = "text-embedding-004"; // Gemini's embedding model
+// Use the correct Gemini embedding model name
+const EMBEDDING_MODEL = "text-embedding-004";
 
 export const loadEmbeddingIndex = (): EmbeddingIndex => {
   try {
@@ -51,8 +52,18 @@ const saveEmbeddingIndex = (index: EmbeddingIndex): void => {
 
 // --- Embedding Generation (Step 2.1) ---
 
+// Helper to split array into chunks for concurrency
+const chunkArray = <T>(array: T[], size: number): T[][] => {
+  const chunked: T[][] = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunked.push(array.slice(i, i + size));
+  }
+  return chunked;
+};
+
 /**
  * Generate embeddings for a batch of notes using Gemini API
+ * Updated for Concurrency: Processes 10 notes at a time
  * @param notes Notes to embed
  * @returns Array of note embeddings
  */
@@ -62,44 +73,70 @@ export const generateEmbeddingsBatch = async (
   const ai = getAIClient();
   const embeddings: NoteEmbedding[] = [];
 
-  // Prepare texts: combine title + snippet of content
-  const texts = notes.map((n) => {
-    const snippet = n.content.substring(0, 500); // First 500 chars
-    return `${n.title}\n${snippet}`;
-  });
+  // Batch size of 10 for reasonable concurrency without rate limiting aggressively
+  const chunks = chunkArray(notes, 10);
 
-  try {
-    // Call Gemini embedding API
-    const response = await ai.models.embedContent({
-      model: EMBEDDING_MODEL,
-      content: {
-        parts: texts.map((text) => ({ text })),
-      },
-    });
+  console.log(
+    `Starting embedding generation for ${notes.length} notes in ${chunks.length} batches...`
+  );
 
-    // Process embeddings
-    const embeddingsList = (response as any).embeddings || [];
+  for (const [index, chunk] of chunks.entries()) {
+    console.log(
+      `Processing batch ${index + 1}/${chunks.length} (${
+        chunk.length
+      } notes)...`
+    );
 
-    notes.forEach((note, index) => {
-      if (embeddingsList[index]) {
-        embeddings.push({
-          noteId: note.id,
-          vector: embeddingsList[index].values || [],
-          timestamp: Date.now(),
-          modelUsed: EMBEDDING_MODEL,
-          textLength: texts[index].length,
+    // Create array of promises for this chunk
+    const chunkPromises = chunk.map(async (note) => {
+      try {
+        const text = `${note.title}\n${note.content.substring(0, 500)}`;
+
+        // Use the correct API format for @google/genai
+        const response = await ai.models.embedContent({
+          model: EMBEDDING_MODEL,
+          contents: text,
         });
+
+        // Handle both possible response shapes
+        const embedding =
+          (response as any).embedding ?? (response as any).embeddings?.[0];
+
+        if (embedding?.values?.length) {
+          return {
+            noteId: note.id,
+            vector: embedding.values,
+            timestamp: Date.now(),
+            modelUsed: EMBEDDING_MODEL,
+            textLength: text.length,
+          } as NoteEmbedding;
+        } else {
+          console.error(`❌ No embedding values for note ${note.id}`);
+          return null;
+        }
+      } catch (err) {
+        console.error(`❌ Failed to embed note ${note.id}:`, err);
+        return null;
       }
     });
 
-    console.log(
-      `Generated embeddings for ${embeddings.length}/${notes.length} notes`
-    );
-    return embeddings;
-  } catch (e) {
-    console.error("Failed to generate embeddings:", e);
-    return [];
+    // Wait for all requests in this chunk to finish
+    const results = await Promise.all(chunkPromises);
+
+    // Filter out nulls and add to main list
+    const validResults = results.filter((r): r is NoteEmbedding => r !== null);
+    embeddings.push(...validResults);
+
+    // Optional: Small delay between chunks to be nice to the API
+    if (index < chunks.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
   }
+
+  console.log(
+    `Generated embeddings for ${embeddings.length}/${notes.length} notes`
+  );
+  return embeddings;
 };
 
 /**
@@ -267,17 +304,33 @@ export const embeddingGuidedPartitioning = (
   minClusterSize: number = 2
 ): EmbeddingPartition[] => {
   const partitions: EmbeddingPartition[] = [];
-  const visited = new Set<string>();
+  const assignedNotes = new Set<string>(); // Notes assigned to a valid cluster
 
   // Find similar pairs
   const pairs = findSimilarPairs(embeddings, similarityThreshold);
 
-  // Build adjacency
+  console.log(
+    `Found ${pairs.length} similar pairs at threshold ${similarityThreshold}`
+  );
+  if (pairs.length > 0) {
+    console.log(
+      `Top 5 similarities:`,
+      pairs
+        .slice(0, 5)
+        .map(
+          (p) =>
+            `${p.note1Id.slice(0, 8)}-${p.note2Id.slice(
+              0,
+              8
+            )}: ${p.similarity.toFixed(3)}`
+        )
+    );
+  }
+
+  // Build adjacency graph
   const graph = new Map<string, Set<string>>();
   embeddings.forEach((e) => {
-    if (!graph.has(e.noteId)) {
-      graph.set(e.noteId, new Set());
-    }
+    graph.set(e.noteId, new Set());
   });
 
   pairs.forEach((pair) => {
@@ -285,63 +338,79 @@ export const embeddingGuidedPartitioning = (
     graph.get(pair.note2Id)?.add(pair.note1Id);
   });
 
-  // Cluster using connected components
-  const clusterNotes = (startId: string, cluster: Set<string>): void => {
+  // Cluster using connected components (BFS)
+  const findConnectedComponent = (startId: string): Set<string> => {
+    const component = new Set<string>();
     const queue = [startId];
 
     while (queue.length > 0) {
       const current = queue.shift()!;
+      if (component.has(current)) continue;
 
-      if (visited.has(current) || cluster.has(current)) continue;
-
-      cluster.add(current);
-      visited.add(current);
+      component.add(current);
 
       const neighbors = graph.get(current) || new Set();
       neighbors.forEach((neighbor) => {
-        if (!visited.has(neighbor)) {
+        if (!component.has(neighbor)) {
           queue.push(neighbor);
         }
       });
     }
+
+    return component;
   };
 
-  // Find all clusters
+  // Find all connected components (clusters)
+  const visited = new Set<string>();
   embeddings.forEach((e) => {
     if (!visited.has(e.noteId)) {
-      const cluster = new Set<string>();
-      clusterNotes(e.noteId, cluster);
+      const component = findConnectedComponent(e.noteId);
 
-      // Only add if meets minimum size
-      if (cluster.size >= minClusterSize) {
-        const clusterEmbeddings = Array.from(cluster)
+      // Mark all notes in this component as visited
+      component.forEach((id) => visited.add(id));
+
+      // Only create partition if it meets minimum size
+      if (component.size >= minClusterSize) {
+        const clusterEmbeddings = Array.from(component)
           .map((id) => embeddings.find((e) => e.noteId === id)!)
+          .filter((e) => e) // safety check
           .map((e) => e.vector);
 
         partitions.push({
           id: `partition-${partitions.length}`,
-          noteIds: Array.from(cluster),
+          noteIds: Array.from(component),
           centroid: computeCentroid(clusterEmbeddings),
-          silhouetteScore: 0, // TODO: compute actual silhouette score
+          silhouetteScore: 0,
         });
+
+        // Mark as assigned
+        component.forEach((id) => assignedNotes.add(id));
       }
     }
   });
 
-  // Singletons become their own partition
-  const unvisited = embeddings.filter((e) => !visited.has(e.noteId));
-  unvisited.forEach((e) => {
-    partitions.push({
-      id: `partition-${partitions.length}`,
-      noteIds: [e.noteId],
-      centroid: e.vector,
-      silhouetteScore: 0,
-    });
-  });
+  // IMPORTANT: Handle unassigned notes (singletons and small groups)
+  // These notes didn't meet minClusterSize but should still be clustered
+  const unassigned = embeddings.filter((e) => !assignedNotes.has(e.noteId));
 
+  if (unassigned.length > 0) {
+    console.log(
+      `⚠️ ${unassigned.length} notes not assigned to clusters, will be grouped in Phase 3`
+    );
+
+    // DON'T create individual singleton partitions - they'll be handled in clusteringService
+    // where unclustered notes get added to an "Additional Topics" cluster
+    // This is better than having many 1-note clusters
+  }
+
+  console.log(`Embedding-guided partitions created:`);
+  partitions.forEach((p, idx) => {
+    console.log(`  Partition ${idx}: ${p.noteIds.length} notes`);
+  });
   console.log(
-    `Created ${partitions.length} partitions from ${embeddings.length} notes`
+    `Total: ${partitions.length} partitions covering ${assignedNotes.size}/${embeddings.length} notes`
   );
+
   return partitions;
 };
 

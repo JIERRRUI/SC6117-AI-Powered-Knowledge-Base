@@ -16,6 +16,8 @@ import {
   dualPromptClusterNotesWithGemini,
   generateSemanticCentroid,
   detectHardSample,
+  generateClusterName,
+  generateSemanticClusterName,
 } from "./geminiService";
 import {
   getOrGenerateEmbeddings,
@@ -253,10 +255,26 @@ export const incrementalCluster = async (
     if (cached.length > 0) return cached;
   }
 
-  // Fallback: full clustering via Gemini service (existing logic).
-  const clusters = await clusterNotesWithGemini(notes);
-  writeCachedClusters(clusters);
-  return clusters;
+  // Use the new 3-phase semantic clustering pipeline
+  console.log("🚀 Running full semantic clustering pipeline...");
+  const result = await fullSemanticClustering(notes, {
+    useHybridEmbeddings: true,
+    useSemanticEnhancement: true,
+    generateCentroids: true,
+    detectHardSamples: true,
+  });
+
+  console.log(
+    `✅ Clustering complete: ${
+      result.clusters.length
+    } clusters, confidence ${result.finalConfidence.toFixed(2)}`
+  );
+  console.log(
+    `📊 Centroids: ${result.centroids.size}, Hard samples: ${result.hardSamples.length}, Constraints: ${result.constraints.totalConstraints}`
+  );
+
+  writeCachedClusters(result.clusters);
+  return result.clusters;
 };
 
 // Enhanced clustering with dual-prompt and iterative refinement (Phase 1)
@@ -329,9 +347,33 @@ export const upsertEmbeddings = async (
 export const clusterWithEmbeddings = async (
   notes: Note[]
 ): Promise<ClusterNode[]> => {
-  // TODO: Use embeddings + hierarchical clustering.
-  // Temporary fallback to LLM clustering.
-  return incrementalCluster(notes);
+  console.log(
+    `🔗 clusterWithEmbeddings: Processing ${notes.length} notes with hierarchical embedding clustering...`
+  );
+
+  try {
+    // Use hierarchical hybrid clustering which combines:
+    // 1. Embedding-based partitioning for semantic grouping
+    // 2. LLM for generating meaningful cluster names
+    // 3. Recursive subdivision for large clusters
+    const clusters = await hierarchicalHybridClustering(
+      notes,
+      0.4, // Lower threshold for better coverage
+      50 // Max cluster size before subdivision
+    );
+
+    console.log(
+      `✅ Embedding clustering complete: ${clusters.length} clusters`
+    );
+    writeCachedClusters(clusters);
+    return clusters;
+  } catch (e) {
+    console.error(
+      "❌ Embedding clustering failed, falling back to LLM clustering:",
+      e
+    );
+    return incrementalCluster(notes);
+  }
 };
 
 // --- Benchmarking utilities ---
@@ -379,20 +421,37 @@ export const benchmarkClustering = async (
 
 /**
  * Convert embedding partitions to ClusterNode structure
+ * @param partitions Embedding-based partitions
+ * @param notes All original notes
+ * @param partitionNames Optional LLM-generated names and descriptions for each partition
  */
 const partitionsToClusterNodes = (
   partitions: EmbeddingPartition[],
-  notes: Note[]
+  notes: Note[],
+  partitionNames?: Array<{ name: string; description: string }>
 ): ClusterNode[] => {
-  return partitions.map((partition) => {
-    const noteMap = new Map(notes.map((n) => [n.id, n]));
-    const clusterName = `Cluster ${partition.id}`;
+  const noteMap = new Map(notes.map((n) => [n.id, n]));
+
+  // Track which notes have been clustered
+  const clusteredNoteIds = new Set<string>();
+
+  const clusters = partitions.map((partition, index) => {
+    // Use LLM-generated name if available
+    let clusterName = `Cluster ${index + 1}`;
+    let clusterDescription = `Partition with ${partition.noteIds.length} notes`;
+
+    if (partitionNames && partitionNames[index]) {
+      clusterName = partitionNames[index].name;
+      clusterDescription = partitionNames[index].description;
+    }
+
+    partition.noteIds.forEach((id) => clusteredNoteIds.add(id));
 
     return {
       id: partition.id,
       name: clusterName,
       type: "cluster" as const,
-      description: `Embedding-based partition with ${partition.noteIds.length} notes`,
+      description: clusterDescription,
       children: partition.noteIds
         .map((noteId) => {
           const note = noteMap.get(noteId);
@@ -404,9 +463,38 @@ const partitionsToClusterNodes = (
             noteId,
           };
         })
-        .filter((n): n is ClusterNode => n !== null),
+        .filter(
+          (
+            n
+          ): n is { id: string; name: string; type: "note"; noteId: string } =>
+            n !== null
+        ),
     };
   });
+
+  // Add unclustered notes - they will get proper names in Phase 3
+  const unclusteredNotes = notes.filter((n) => !clusteredNoteIds.has(n.id));
+  if (unclusteredNotes.length > 0) {
+    console.log(
+      `⚠️ Found ${unclusteredNotes.length} unclustered notes, creating additional cluster`
+    );
+
+    // Create a temporary cluster - Phase 3 will give it a proper name
+    clusters.push({
+      id: "unclustered-group",
+      name: "Additional Topics", // Will be renamed by LLM in Phase 3
+      type: "cluster" as const,
+      description: `Notes requiring semantic analysis (${unclusteredNotes.length})`,
+      children: unclusteredNotes.map((note) => ({
+        id: `unclustered-${note.id}`,
+        name: note.title,
+        type: "note" as const,
+        noteId: note.id,
+      })),
+    });
+  }
+
+  return clusters;
 };
 
 /**
@@ -418,7 +506,7 @@ const partitionsToClusterNodes = (
  */
 export const hybridClusterWithEmbeddings = async (
   notes: Note[],
-  similarityThreshold: number = 0.65,
+  similarityThreshold: number = 0.4,
   useRefinement: boolean = true
 ): Promise<ClusterNode[]> => {
   console.log(`Starting hybrid clustering for ${notes.length} notes...`);
@@ -448,34 +536,43 @@ export const hybridClusterWithEmbeddings = async (
       2 // minClusterSize
     );
 
-    // Convert to ClusterNodes
-    let clusters = partitionsToClusterNodes(partitions, notes);
-
-    // Step 3: Optional LLM refinement for quality
-    if (useRefinement && partitions.length > 1) {
-      console.log(`Refining ${clusters.length} partitions with LLM...`);
-
-      // For now, enhance the cluster descriptions with LLM
-      // Future: iterative refinement of partition assignments
-      const refined = await enhancedCluster(notes, false);
-
-      // Merge: use embedding structure but enhance with LLM insights
-      if (refined.length > 0) {
-        console.log(
-          `LLM refinement added insights to ${refined.length} clusters`
+    // Step 3: Generate meaningful names for each partition using LLM
+    console.log(
+      `Generating meaningful names for ${partitions.length} partitions...`
+    );
+    const partitionNames = await Promise.all(
+      partitions.map(async (partition) => {
+        const partitionNotes = notes.filter((n) =>
+          partition.noteIds.includes(n.id)
         );
-        // Merge descriptions from LLM clustering
-        clusters.forEach((cluster, i) => {
-          if (refined[i]) {
-            cluster.description = `${cluster.description} | LLM: ${
-              refined[i].description || ""
-            }`;
-          }
-        });
-      }
-    }
+        if (!useRefinement || partitionNotes.length === 0) {
+          return {
+            name: `Topic Group`,
+            description: `Group of ${partition.noteIds.length} notes`,
+          };
+        }
+        try {
+          return await generateClusterName(partitionNotes);
+        } catch (e) {
+          console.error(
+            `Failed to generate name for partition ${partition.id}:`,
+            e
+          );
+          return {
+            name: `Topic Group`,
+            description: `Group of ${partition.noteIds.length} notes`,
+          };
+        }
+      })
+    );
+    console.log(`Generated ${partitionNames.length} cluster names`);
+
+    // Convert to ClusterNodes with meaningful names
+    let clusters = partitionsToClusterNodes(partitions, notes, partitionNames);
 
     const duration = Math.round(performance.now() - start);
+    //print for debugging
+    console.log("Clusters after embedding partitioning and naming:", clusters);
     console.log(
       `Hybrid clustering complete: ${clusters.length} clusters in ${duration}ms`
     );
@@ -500,7 +597,7 @@ export const hybridClusterWithEmbeddings = async (
  */
 export const hierarchicalHybridClustering = async (
   notes: Note[],
-  initialThreshold: number = 0.65,
+  initialThreshold: number = 0.4,
   maxClusterSize: number = 200
 ): Promise<ClusterNode[]> => {
   console.log(
@@ -560,6 +657,8 @@ export const hierarchicalHybridClustering = async (
   console.log(
     `Hierarchical clustering complete with ${hierarchical.length} root clusters`
   );
+  //print for debugging
+  console.log("Hierarchical Clusters:", hierarchical);
   return hierarchical;
 };
 // --- Semantic Enhancement (Phase 3) ---
@@ -576,7 +675,10 @@ export const generateSemanticCentroids = async (
 ): Promise<Map<string, SemanticCentroid>> => {
   const centroids = new Map<string, SemanticCentroid>();
   const noteMap = new Map(notes.map((n) => [n.id, n]));
-
+  //print for debugging
+  console.log("Note Map size:", noteMap.size);
+  console.log("Clusters to process:", clusters.length);
+  console.log("Generating semantic centroids for clusters...");
   for (const cluster of clusters) {
     if (cluster.type === "cluster") {
       // Get notes in this cluster
@@ -736,10 +838,112 @@ export const semanticEnhancedClustering = async (
     ? await detectAndAugmentHardSamples(clusters, notes, 0.65)
     : [];
 
-  // Step 3: Generate supervision signals
+  // Step 3: Re-enhance cluster names with semantic analysis
+  console.log("Enhancing cluster names with semantic context...");
+  const noteMap = new Map(notes.map((n) => [n.id, n]));
+  const enhancedClusters = await Promise.all(
+    clusters.map(async (cluster) => {
+      try {
+        const clusterNotes =
+          cluster.children
+            ?.filter((child) => child.type === "note" && child.noteId)
+            .map((child) => noteMap.get(child.noteId!))
+            .filter((n): n is Note => n !== undefined) || [];
+
+        if (clusterNotes.length === 0) {
+          return cluster;
+        }
+
+        const centroid = centroids.get(cluster.id);
+        const { name, description } = await generateSemanticClusterName(
+          clusterNotes,
+          centroid
+        );
+
+        return {
+          ...cluster,
+          name,
+          description,
+        };
+      } catch (e) {
+        console.error(`Failed to enhance cluster ${cluster.id}:`, e);
+        return cluster;
+      }
+    })
+  );
+
+  // Step 4: Generate supervision signals
   const constraints = generateSupervisionSignals(hardSamples);
 
-  // Step 4: Calculate final confidence
+  // Step 5: Apply constraints (Self-Healing)
+  // Logic: Move hard samples to their 'must-link' clusters if specified
+  if (constraints.mustLinkPairs.length > 0) {
+    console.log("⚡ Applying supervision signals to refine clusters...");
+
+    // Helper to find which cluster currently contains a note
+    const findParentCluster = (noteId: string): ClusterNode | undefined => {
+      return enhancedClusters.find((c) =>
+        c.children?.some((child) => child.noteId === noteId)
+      );
+    };
+
+    let movedCount = 0;
+
+    // Only process 'must-link' constraints where the target is a cluster
+    constraints.mustLinkPairs.forEach((signal) => {
+      if (
+        signal.type === "must-link" &&
+        signal.note2Id.startsWith("cluster-")
+      ) {
+        const noteId = signal.note1Id;
+        const targetClusterId = signal.note2Id.replace("cluster-", "");
+
+        // Find current home and target home
+        const currentCluster = findParentCluster(noteId);
+        // Match partition ID format "partition-X"
+        const targetCluster = enhancedClusters.find(
+          (c) =>
+            c.id === targetClusterId || c.id === `partition-${targetClusterId}`
+        );
+
+        if (
+          currentCluster &&
+          targetCluster &&
+          currentCluster.id !== targetCluster.id
+        ) {
+          // Find the node in the current cluster
+          const noteNodeIndex = currentCluster.children!.findIndex(
+            (c) => c.noteId === noteId
+          );
+
+          if (noteNodeIndex > -1) {
+            // Remove from current
+            const [noteNode] = currentCluster.children!.splice(
+              noteNodeIndex,
+              1
+            );
+
+            // Add to target
+            if (!targetCluster.children) targetCluster.children = [];
+            targetCluster.children.push(noteNode);
+
+            console.log(
+              `Self-Healing: Moved note ${noteId} from "${currentCluster.name}" to "${targetCluster.name}"`
+            );
+            movedCount++;
+          }
+        }
+      }
+    });
+
+    if (movedCount > 0) {
+      console.log(
+        `✅ Self-Healing complete: Moved ${movedCount} notes based on semantic analysis.`
+      );
+    }
+  }
+
+  // Step 6: Calculate final confidence
   const avgCentroidConfidence =
     centroids.size > 0
       ? Array.from(centroids.values()).reduce(
@@ -751,7 +955,7 @@ export const semanticEnhancedClustering = async (
   const duration = Math.round(performance.now() - start);
 
   const result: SemanticClusteringResult = {
-    clusters,
+    clusters: enhancedClusters,
     centroids,
     hardSamples,
     constraints,
@@ -760,7 +964,7 @@ export const semanticEnhancedClustering = async (
   };
 
   console.log(
-    `Semantic enhancement complete: ${centroids.size} centroids, ${hardSamples.length} hard samples, ${duration}ms`
+    `Semantic enhancement complete: ${centroids.size} centroids, ${hardSamples.length} hard samples, ${enhancedClusters.length} clusters enhanced, ${duration}ms`
   );
 
   return result;
@@ -793,8 +997,14 @@ export const fullSemanticClustering = async (
   // Phase 2: Hybrid embeddings
   let clusters: ClusterNode[];
   if (useHybridEmbeddings) {
-    console.log("Phase 2: Embedding-guided clustering");
-    clusters = await hybridClusterWithEmbeddings(notes, 0.65, true);
+    console.log("Phase 2: Hierarchical Embedding-guided clustering");
+    // CHANGED: Use hierarchicalHybridClustering instead of hybridClusterWithEmbeddings
+    // This allows large topics to be broken down into subtopics
+    clusters = await hierarchicalHybridClustering(
+      notes,
+      0.4, // Lower threshold for better coverage (was 0.65)
+      50 // Max size before splitting (keep reasonably small for good hierarchy)
+    );
   } else {
     console.log("Phase 1: Enhanced LLM clustering");
     clusters = await enhancedCluster(notes, true);
