@@ -3,6 +3,8 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Note, SearchMode, SearchResult, ProcessingStatus, ClusterNode } from './types';
 import { clusterNotesWithGemini, semanticSearchWithGemini, correctTextWithGemini } from './services/geminiService';
 import { incrementalCluster, benchmarkClustering, fullSemanticClustering } from './services/clusteringService';
+import { clusterNotesWithGemini, correctTextWithGemini } from './services/geminiService';
+import { executeExactSearch, executeHybridSearch } from './services/searchService';
 import { getAllNotes, saveNote, deleteNote, bulkSaveNotes } from './services/storageService';
 import { SearchIcon, FileTextIcon, NetworkIcon, ZapIcon, LayersIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, WifiOffIcon, UploadCloudIcon, XIcon, PlusIcon, WandIcon, TrashIcon, SaveIcon } from './components/Icons';
 import ClusterGraph from './components/ClusterGraph';
@@ -110,9 +112,16 @@ const SearchResultItem: React.FC<SearchResultItemProps> = ({
         {Math.round(result.score)}{result.reason ? '/100' : ''}
       </span>
     </div>
-    <div className="text-sm text-muted mt-1 line-clamp-2">
-      {result.note.content.substring(0, 150)}...
-    </div>
+    {result.highlight ? (
+      <div
+        className="text-sm text-muted mt-1 line-clamp-2"
+        dangerouslySetInnerHTML={{ __html: result.highlight }}
+      />
+    ) : (
+      <div className="text-sm text-muted mt-1 line-clamp-2">
+        {result.note.content.substring(0, 150)}...
+      </div>
+    )}
     {result.reason && (
       <div className="mt-2 text-xs text-secondary bg-secondary/10 p-2 rounded border border-secondary/20">
         <span className="font-bold">AI Reason:</span> {result.reason}
@@ -382,31 +391,28 @@ const App = () => {
 
   // Handlers
   const handleSearch = useCallback(async () => {
-    if (!searchQuery.trim()) {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
       setSearchResults([]);
       return;
     }
+
+    const effectiveMode = !isOnline ? SearchMode.EXACT : searchMode;
 
     if (!isOnline && searchMode !== SearchMode.EXACT) {
       setSearchMode(SearchMode.EXACT);
     }
 
-    setStatus({ isProcessing: true, message: 'Searching...' });
+    setStatus({
+      isProcessing: true,
+      message: effectiveMode === SearchMode.EXACT ? 'Searching...' : 'Searching with hybrid AI...'
+    });
     
     try {
-      let results: SearchResult[] = [];
-
-      if (searchMode === SearchMode.EXACT) {
-        // Grep-style local search
-        const lowerQ = searchQuery.toLowerCase();
-        results = notes
-          .filter(n => n.title.toLowerCase().includes(lowerQ) || n.content.toLowerCase().includes(lowerQ))
-          .map(n => ({ note: n, score: 100 }));
-      } else {
-        // Semantic Search via Gemini
-        setStatus({ isProcessing: true, message: 'Consulting Gemini for semantic matches...' });
-        results = await semanticSearchWithGemini(searchQuery, notes);
-      }
+      const results: SearchResult[] =
+        effectiveMode === SearchMode.EXACT
+          ? executeExactSearch(trimmed, notes, { mode: SearchMode.EXACT, useRegex: true })
+          : await executeHybridSearch(trimmed, notes, { mode: effectiveMode, useRegex: true });
 
       setSearchResults(results);
     } catch (e) {
@@ -417,19 +423,19 @@ const App = () => {
     }
   }, [searchQuery, searchMode, notes, isOnline]);
 
-  // Debounce simple search
+  // Debounce search (hybrid/semantic are heavier)
   useEffect(() => {
-    if (searchMode === SearchMode.EXACT) {
-      const timer = setTimeout(handleSearch, 300);
-      return () => clearTimeout(timer);
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      return;
     }
+    const timer = setTimeout(handleSearch, 300);
+    return () => clearTimeout(timer);
   }, [searchQuery, searchMode, handleSearch]);
 
-  // Trigger Semantic Search on Enter or Button
+  // Trigger Semantic/Hybrid Search on Enter or Button
   const triggerSemanticSearch = () => {
-    if (searchMode !== SearchMode.EXACT && isOnline) {
-      handleSearch();
-    }
+    handleSearch();
   };
 
   const handleCluster = async () => {

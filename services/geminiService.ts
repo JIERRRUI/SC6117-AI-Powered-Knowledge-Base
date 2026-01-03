@@ -510,7 +510,7 @@ export const semanticSearchWithGemini = async (
   const notesLite = notes.map((n) => ({
     id: n.id,
     title: n.title,
-    summary: n.content.substring(0, 300),
+    contentSnippet: n.content.substring(0, 200),
   }));
 
   const prompt = `
@@ -521,7 +521,7 @@ export const semanticSearchWithGemini = async (
     For each note, provide a relevance score (0-100) and a brief reasoning.
     If a note is not relevant, do not include it.
 
-    Notes Data:
+    Notes Data (only lightweight fields provided):
     ${JSON.stringify(notesLite)}
   `;
 
