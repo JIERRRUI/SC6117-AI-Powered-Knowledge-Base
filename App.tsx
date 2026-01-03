@@ -6,6 +6,7 @@ import { incrementalCluster, benchmarkClustering, fullSemanticClustering } from 
 import { getAllNotes, saveNote, deleteNote, bulkSaveNotes } from './services/storageService';
 import { SearchIcon, FileTextIcon, NetworkIcon, ZapIcon, LayersIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, WifiOffIcon, UploadCloudIcon, XIcon, PlusIcon, WandIcon, TrashIcon, SaveIcon } from './components/Icons';
 import ClusterGraph from './components/ClusterGraph';
+import { generateMockNotes } from './mockNotes';
 
 // --- Helper Functions for File Processing ---
 
@@ -600,6 +601,38 @@ const App = () => {
     }
   };
 
+  // Load 100 mock notes for testing and demo
+  const handleLoadSampleData = async () => {
+    setStatus({ isProcessing: true, message: 'Loading 100 sample notes...' });
+    try {
+      const mockNotes = generateMockNotes();
+      console.log(`📝 Generated ${mockNotes.length} mock notes`);
+      
+      // Save to database
+      await bulkSaveNotes(mockNotes);
+      
+      // Update state
+      setNotes(prev => [...prev, ...mockNotes]);
+      
+      // Expand all folders
+      const allFolders = new Set(mockNotes.map(n => n.folder));
+      setExpandedFolders(prev => new Set([...prev, ...allFolders]));
+      
+      // Reset clustering
+      if (hasClustered) {
+        setHasClustered(false);
+        setClusters([]);
+      }
+      
+      setStatus({ isProcessing: false, message: `✅ Loaded ${mockNotes.length} sample notes` });
+      setTimeout(() => setStatus({ isProcessing: false, message: '' }), 3000);
+    } catch (e) {
+      console.error('Failed to load sample data:', e);
+      setStatus({ isProcessing: false, message: '' });
+      alert('Failed to load sample notes. Check console.');
+    }
+  };
+
   const handleDeleteNote = async (id: string) => {
     if (window.confirm('Are you sure you want to delete this note?')) {
         // Optimistic UI update
@@ -803,6 +836,15 @@ const App = () => {
           >
             <UploadCloudIcon className="w-3 h-3" />
             Import
+          </button>
+          <button 
+            onClick={handleLoadSampleData}
+            disabled={status.isProcessing}
+            className="flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-white/5 hover:bg-white/10 text-muted hover:text-white disabled:opacity-50"
+            title="Load 100 sample notes for testing"
+          >
+            <ZapIcon className="w-3 h-3" />
+            Samples
           </button>
           <button 
             onClick={handleCluster}

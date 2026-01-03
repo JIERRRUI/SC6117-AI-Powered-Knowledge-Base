@@ -348,22 +348,20 @@ export const clusterWithEmbeddings = async (
   notes: Note[]
 ): Promise<ClusterNode[]> => {
   console.log(
-    `🔗 clusterWithEmbeddings: Processing ${notes.length} notes with hierarchical embedding clustering...`
+    `🔗 clusterWithEmbeddings: Processing ${notes.length} notes with 3-level hierarchical clustering...`
   );
 
   try {
-    // Use hierarchical hybrid clustering which combines:
-    // 1. Embedding-based partitioning for semantic grouping
-    // 2. LLM for generating meaningful cluster names
-    // 3. Recursive subdivision for large clusters
+    // Use 3-level hierarchical clustering:
+    // Level 0: Root, Level 1: Domains, Level 2: Subtopics
     const clusters = await hierarchicalHybridClustering(
       notes,
-      0.4, // Lower threshold for better coverage
-      50 // Max cluster size before subdivision
+      0.3, // Domain threshold
+      0.5 // Subtopic threshold
     );
 
     console.log(
-      `✅ Embedding clustering complete: ${clusters.length} clusters`
+      `✅ Hierarchical clustering complete: ${clusters.length} top-level domains`
     );
     writeCachedClusters(clusters);
     return clusters;
@@ -589,77 +587,105 @@ export const hybridClusterWithEmbeddings = async (
 };
 
 /**
- * Multi-level hybrid clustering for scalability (1000+ notes)
+ * 3-Level Hierarchical Clustering:
+ * Level 0: Root (single node containing all)
+ * Level 1: High-level domains (e.g., "Technology", "Cooking", "Personal")
+ * Level 2: Subtopics (e.g., "Machine Learning", "Web Development")
+ *
  * @param notes Notes to cluster
- * @param initialThreshold Embedding similarity threshold
- * @param maxClusterSize Maximum notes per cluster before subdivision
- * @returns Hierarchical cluster structure
+ * @param domainThreshold Threshold for Level 1 domains (higher = fewer, broader domains)
+ * @param subtopicThreshold Threshold for Level 2 subtopics (lower = more granular subtopics)
+ * @returns Hierarchical cluster structure with root node
  */
 export const hierarchicalHybridClustering = async (
   notes: Note[],
-  initialThreshold: number = 0.4,
-  maxClusterSize: number = 200
+  domainThreshold: number = 0.3,
+  subtopicThreshold: number = 0.5
 ): Promise<ClusterNode[]> => {
   console.log(
-    `Starting hierarchical hybrid clustering for ${notes.length} notes...`
+    `🏗️ Starting 3-level hierarchical clustering for ${notes.length} notes...`
+  );
+  console.log(
+    `   Domain threshold: ${domainThreshold}, Subtopic threshold: ${subtopicThreshold}`
   );
 
-  // Step 1: Initial embedding-based partitioning
-  const clusters = await hybridClusterWithEmbeddings(
+  // Step 1: Create Level 1 - High-level domains (broad grouping)
+  console.log("📊 Level 1: Creating high-level domains...");
+  const domains = await hybridClusterWithEmbeddings(
     notes,
-    initialThreshold,
-    false
+    domainThreshold,
+    true // Generate names for domains
+  );
+  console.log(`   Created ${domains.length} high-level domains`);
+
+  // Step 2: For each domain, create Level 2 - Subtopics (finer grouping)
+  console.log("📂 Level 2: Creating subtopics within each domain...");
+  const domainsWithSubtopics = await Promise.all(
+    domains.map(async (domain) => {
+      // Get notes in this domain
+      const domainNoteIds =
+        domain.children
+          ?.filter((c) => c.type === "note")
+          .map((c) => c.noteId)
+          .filter((id): id is string => Boolean(id)) || [];
+
+      // If domain has enough notes, subdivide into subtopics
+      if (domainNoteIds.length >= 3) {
+        const domainNotes = notes.filter((n) => domainNoteIds.includes(n.id));
+
+        console.log(
+          `   Subdividing "${domain.name}" (${domainNotes.length} notes)...`
+        );
+
+        try {
+          const subtopics = await hybridClusterWithEmbeddings(
+            domainNotes,
+            subtopicThreshold,
+            true // Generate names for subtopics
+          );
+
+          // If we got meaningful subtopics (more than 1), use them
+          if (subtopics.length > 1) {
+            console.log(`     → ${subtopics.length} subtopics created`);
+            return {
+              ...domain,
+              children: subtopics, // Replace flat notes with subtopic clusters
+            };
+          }
+        } catch (e) {
+          console.warn(
+            `     → Subtopic creation failed, keeping flat structure`
+          );
+        }
+      }
+
+      // Keep original structure if not enough notes or subdivision failed
+      return domain;
+    })
   );
 
-  // Step 2: Subdivide large clusters recursively
-  const processCluster = async (
-    cluster: ClusterNode,
-    depth: number = 1
-  ): Promise<ClusterNode> => {
-    if (cluster.type === "note" || !cluster.children) {
-      return cluster;
-    }
-
-    const noteIds = cluster.children
-      .filter((c) => c.type === "note")
-      .map((c) => c.noteId)
-      .filter((id): id is string => Boolean(id));
-
-    // If cluster is too large, subdivide
-    if (noteIds.length > maxClusterSize && depth < 3) {
-      const childNotes = notes.filter((n) => noteIds.includes(n.id));
-      const threshold = initialThreshold - depth * 0.05; // Lower threshold for finer granularity
-
-      console.log(
-        `Subdividing cluster "${cluster.name}" (${noteIds.length} notes, depth ${depth})...`
-      );
-
-      const subClusters = await hybridClusterWithEmbeddings(
-        childNotes,
-        Math.max(0.5, threshold),
-        false
-      );
-
-      return {
-        ...cluster,
-        children: subClusters,
-      };
-    }
-
-    return cluster;
+  // Step 3: Create Level 0 - Root node wrapping everything
+  const rootNode: ClusterNode = {
+    id: "root",
+    name: "Knowledge Base",
+    type: "cluster",
+    description: `All notes organized into ${domainsWithSubtopics.length} domains`,
+    children: domainsWithSubtopics,
   };
 
-  // Process all clusters
-  const hierarchical = await Promise.all(
-    clusters.map((c) => processCluster(c))
-  );
+  console.log(`✅ Hierarchical clustering complete:`);
+  console.log(`   Level 0: 1 root node`);
+  console.log(`   Level 1: ${domainsWithSubtopics.length} domains`);
+  const totalSubtopics = domainsWithSubtopics.reduce((sum, d) => {
+    const subtopicCount =
+      d.children?.filter((c) => c.type === "cluster").length || 0;
+    return sum + subtopicCount;
+  }, 0);
+  console.log(`   Level 2: ${totalSubtopics} subtopics`);
 
-  console.log(
-    `Hierarchical clustering complete with ${hierarchical.length} root clusters`
-  );
-  //print for debugging
-  console.log("Hierarchical Clusters:", hierarchical);
-  return hierarchical;
+  // Return array with root node (or just domains if you prefer flat array)
+  // For graph visualization, returning domains might be better
+  return domainsWithSubtopics;
 };
 // --- Semantic Enhancement (Phase 3) ---
 
@@ -994,16 +1020,15 @@ export const fullSemanticClustering = async (
 
   console.log("Starting full semantic clustering pipeline...");
 
-  // Phase 2: Hybrid embeddings
+  // Phase 2: Hybrid embeddings with 3-level hierarchy
   let clusters: ClusterNode[];
   if (useHybridEmbeddings) {
-    console.log("Phase 2: Hierarchical Embedding-guided clustering");
-    // CHANGED: Use hierarchicalHybridClustering instead of hybridClusterWithEmbeddings
-    // This allows large topics to be broken down into subtopics
+    console.log("Phase 2: 3-Level Hierarchical Clustering");
+    // Level 0: Root, Level 1: Domains, Level 2: Subtopics
     clusters = await hierarchicalHybridClustering(
       notes,
-      0.4, // Lower threshold for better coverage (was 0.65)
-      50 // Max size before splitting (keep reasonably small for good hierarchy)
+      0.3, // Domain threshold (lower = more notes grouped together)
+      0.5 // Subtopic threshold (higher = finer subtopics)
     );
   } else {
     console.log("Phase 1: Enhanced LLM clustering");
