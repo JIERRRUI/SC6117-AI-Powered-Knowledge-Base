@@ -1105,22 +1105,28 @@ export const generateSemanticCentroids = async (
 ): Promise<Map<string, SemanticCentroid>> => {
   const centroids = new Map<string, SemanticCentroid>();
   const noteMap = new Map(notes.map((n) => [n.id, n]));
-  //print for debugging
-  console.log("Note Map size:", noteMap.size);
-  console.log("Clusters to process:", clusters.length);
-  console.log("Generating semantic centroids for clusters...");
-  for (const cluster of clusters) {
-    if (cluster.type === "cluster") {
-      // Get notes in this cluster
-      const clusterNoteIds =
-        cluster.children
-          ?.filter((c) => c.type === "note")
-          .map((c) => c.noteId)
-          .filter((id): id is string => Boolean(id)) || [];
 
-      const clusterNotes = clusterNoteIds
-        .map((id) => noteMap.get(id))
-        .filter((n): n is Note => Boolean(n));
+  // Helper: Recursively get all notes from a cluster
+  const getNotesFromCluster = (cluster: ClusterNode): Note[] => {
+    const result: Note[] = [];
+    if (!cluster.children) return result;
+
+    for (const child of cluster.children) {
+      if (child.type === "note" && child.noteId) {
+        const note = noteMap.get(child.noteId);
+        if (note) result.push(note);
+      } else if (child.type === "cluster") {
+        result.push(...getNotesFromCluster(child));
+      }
+    }
+    return result;
+  };
+
+  // Recursively process clusters and subclusters
+  const processCluster = async (cluster: ClusterNode) => {
+    if (cluster.type === "cluster") {
+      // Get all notes (including from nested subclusters)
+      const clusterNotes = getNotesFromCluster(cluster);
 
       if (clusterNotes.length > 0) {
         const centroid = await generateSemanticCentroid(
@@ -1130,7 +1136,24 @@ export const generateSemanticCentroids = async (
         );
         centroids.set(cluster.id, centroid);
       }
+
+      // Process subclusters too
+      if (cluster.children) {
+        for (const child of cluster.children) {
+          if (child.type === "cluster") {
+            await processCluster(child);
+          }
+        }
+      }
     }
+  };
+
+  console.log("Note Map size:", noteMap.size);
+  console.log("Clusters to process:", clusters.length);
+  console.log("Generating semantic centroids for clusters...");
+
+  for (const cluster of clusters) {
+    await processCluster(cluster);
   }
 
   console.log(`Generated ${centroids.size} semantic centroids`);
@@ -1271,35 +1294,69 @@ export const semanticEnhancedClustering = async (
   // Step 3: Re-enhance cluster names with semantic analysis
   console.log("Enhancing cluster names with semantic context...");
   const noteMap = new Map(notes.map((n) => [n.id, n]));
-  const enhancedClusters = await Promise.all(
-    clusters.map(async (cluster) => {
-      try {
-        const clusterNotes =
-          cluster.children
-            ?.filter((child) => child.type === "note" && child.noteId)
-            .map((child) => noteMap.get(child.noteId!))
-            .filter((n): n is Note => n !== undefined) || [];
 
-        if (clusterNotes.length === 0) {
-          return cluster;
-        }
+  // Helper: Recursively get all notes from a cluster (including nested subclusters)
+  const getClusterNotes = (cluster: ClusterNode): Note[] => {
+    const clusterNotes: Note[] = [];
+    if (!cluster.children) return clusterNotes;
 
-        const centroid = centroids.get(cluster.id);
-        const { name, description } = await generateSemanticClusterName(
-          clusterNotes,
-          centroid
-        );
-
-        return {
-          ...cluster,
-          name,
-          description,
-        };
-      } catch (e) {
-        console.error(`Failed to enhance cluster ${cluster.id}:`, e);
-        return cluster;
+    for (const child of cluster.children) {
+      if (child.type === "note" && child.noteId) {
+        const note = noteMap.get(child.noteId);
+        if (note) clusterNotes.push(note);
+      } else if (child.type === "cluster") {
+        // Recursively get notes from subclusters
+        clusterNotes.push(...getClusterNotes(child));
       }
-    })
+    }
+    return clusterNotes;
+  };
+
+  // Recursively enhance cluster and all its subclusters
+  const enhanceClusterRecursively = async (
+    cluster: ClusterNode
+  ): Promise<ClusterNode> => {
+    // First, recursively enhance any subclusters
+    let enhancedChildren = cluster.children;
+    if (cluster.children) {
+      enhancedChildren = await Promise.all(
+        cluster.children.map(async (child) => {
+          if (child.type === "cluster") {
+            return await enhanceClusterRecursively(child);
+          }
+          return child;
+        })
+      );
+    }
+
+    // Get all notes in this cluster (including from subclusters)
+    const clusterNotes = getClusterNotes(cluster);
+
+    if (clusterNotes.length === 0) {
+      return { ...cluster, children: enhancedChildren };
+    }
+
+    try {
+      const centroid = centroids.get(cluster.id);
+      const { name, description } = await generateSemanticClusterName(
+        clusterNotes,
+        centroid
+      );
+
+      return {
+        ...cluster,
+        name,
+        description,
+        children: enhancedChildren,
+      };
+    } catch (e) {
+      console.error(`Failed to enhance cluster ${cluster.id}:`, e);
+      return { ...cluster, children: enhancedChildren };
+    }
+  };
+
+  const enhancedClusters = await Promise.all(
+    clusters.map((cluster) => enhanceClusterRecursively(cluster))
   );
 
   // Step 4: Generate supervision signals

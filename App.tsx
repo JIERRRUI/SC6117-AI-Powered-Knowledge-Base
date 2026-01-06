@@ -59,34 +59,133 @@ const convertHtmlToMarkdown = (html: string): string => {
 };
 
 // Extract readable text from binary files (like .one)
-const extractTextFromBinary = async (file: File): Promise<string> => {
+// Filters out metadata, timestamps, formatting markers, and historical/other notes
+// Only extracts content for the specific note matching the title
+const extractTextFromBinary = async (file: File, noteTitle: string): Promise<string> => {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
   let result = "";
   let currentRun = "";
   
   // Iterate through bytes to find sequences of printable ASCII characters
-  // This mimics the unix 'strings' command
+  // Require longer runs (8+ chars) to reduce noise
   for (let i = 0; i < bytes.length; i++) {
     const code = bytes[i];
     // 32-126 are printable ASCII, 10 is LF, 13 is CR, 9 is Tab
     if ((code >= 32 && code <= 126) || code === 10 || code === 13 || code === 9) {
       currentRun += String.fromCharCode(code);
     } else {
-      // If we have a run of 4+ characters, keep it
-      if (currentRun.length >= 4) {
+      // Require 8+ characters to filter more noise
+      if (currentRun.length >= 8) {
         result += currentRun + "\n";
       }
       currentRun = "";
     }
   }
   // Add final run
-  if (currentRun.length >= 4) {
+  if (currentRun.length >= 8) {
     result += currentRun;
   }
   
-  return result.length > 0 
-    ? result 
+  // Helper: Check if a line looks like a real sentence/phrase
+  const looksLikeContent = (text: string): boolean => {
+    // Must have at least 2 words (contain a space with letters on both sides)
+    if (!/[a-zA-Z]+\s+[a-zA-Z]+/.test(text)) return false;
+    
+    // At least 60% should be letters or spaces
+    const letterAndSpaceCount = (text.match(/[a-zA-Z\s]/g) || []).length;
+    if (letterAndSpaceCount < text.length * 0.6) return false;
+    
+    // Must have reasonable word-like patterns (3+ letter sequences)
+    const words = text.match(/[a-zA-Z]{3,}/g) || [];
+    if (words.length < 2) return false;
+    
+    return true;
+  };
+  
+  // Filter out junk: remove timestamps, metadata markers, binary artifacts
+  const lines = result.split('\n');
+  const cleanLines: string[] = [];
+  const seenContent = new Set<string>(); // Track duplicates
+  
+  for (const line of lines) {
+    // Remove tabs and normalize whitespace
+    const trimmed = line.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim();
+    
+    // Skip empty or very short lines
+    if (trimmed.length < 10) continue;
+    
+    // Skip timestamp patterns
+    if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(trimmed)) continue;
+    if (/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),/i.test(trimmed)) continue;
+    if (/^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i.test(trimmed)) continue;
+    
+    // Skip lines with common binary markers (brackets, pipes, tildes at edges)
+    if (/^[\[\]{}|~<>!@#$%^&*()_+=\-\\:;'"`,?\/]/.test(trimmed)) continue;
+    if (/[\[\]{}|~<>!@#$%^&*()_+=\-\\:;'"`,?\/]$/.test(trimmed)) continue;
+    
+    // Skip lines that don't look like real content (sentences/phrases)
+    if (!looksLikeContent(trimmed)) continue;
+    
+    // Deduplicate
+    if (seenContent.has(trimmed)) continue;
+    seenContent.add(trimmed);
+    
+    // Keep this line
+    cleanLines.push(trimmed);
+  }
+  
+  // Now find only content for the target note (by title match)
+  // OneNote stores notes with title followed by content
+  // Find the section that matches our title and extract only that content
+  const normalizedTitle = noteTitle.toLowerCase().trim();
+  let targetContent: string[] = [];
+  let foundTargetNote = false;
+  let lastTitleIndex = -1;
+  
+  // First pass: find the last occurrence of the target title (most recent version)
+  for (let i = 0; i < cleanLines.length; i++) {
+    const lineLower = cleanLines[i].toLowerCase();
+    if (lineLower.includes(normalizedTitle) || normalizedTitle.includes(lineLower.replace(/[^a-z0-9\s]/g, ''))) {
+      lastTitleIndex = i;
+    }
+  }
+  
+  // If we found the title, extract content after it until we hit another title-like line
+  if (lastTitleIndex >= 0) {
+    foundTargetNote = true;
+    // Skip the title line itself (we'll add it in the template)
+    for (let i = lastTitleIndex + 1; i < cleanLines.length; i++) {
+      const line = cleanLines[i];
+      const lineLower = line.toLowerCase();
+      
+      // Stop if we hit another note's title (short line that looks like a heading)
+      // A title is typically short (< 50 chars) and doesn't have sentence punctuation
+      const isLikelyTitle = line.length < 50 && !/[.!?]$/.test(line) && /^[A-Z]/.test(line);
+      
+      // Also stop if this line matches a different known heading pattern
+      if (isLikelyTitle && !lineLower.includes(normalizedTitle) && i > lastTitleIndex + 1) {
+        // Check if it looks like a new section (capitalized, no punctuation)
+        const wordCount = (line.match(/\s+/g) || []).length + 1;
+        if (wordCount <= 5) {
+          break; // Likely a new note title, stop here
+        }
+      }
+      
+      targetContent.push(line);
+    }
+  }
+  
+  // If we found target content, return it; otherwise return all clean content
+  if (foundTargetNote && targetContent.length > 0) {
+    return targetContent.join('\n').trim();
+  }
+  
+  // Fallback: return all clean content if we couldn't isolate the target note
+  const cleanContent = cleanLines.join('\n').trim();
+  
+  return cleanContent.length > 0 
+    ? cleanContent 
     : "Binary content detected but no readable text could be extracted.";
 };
 
@@ -504,9 +603,9 @@ const App = () => {
           }
         } 
         else if (name.match(/\.one$/i)) {
-          // OneNote Binary Import
-          const extractedText = await extractTextFromBinary(file);
-          content = `# ${title} (OneNote Extract)\n\n> **Note:** This content was extracted from a binary OneNote file. Formatting may be lost.\n\n${extractedText}`;
+          // OneNote Binary Import - extract only the content for this specific note
+          const extractedText = await extractTextFromBinary(file, title);
+          content = `# ${title}\n\n${extractedText}`;
         }
 
         if (content) {
@@ -527,7 +626,24 @@ const App = () => {
         // Update State
         setNotes(prev => [...prev, ...newNotes]);
         setExpandedFolders(prev => new Set(prev).add('/uploads'));
-        // Note: Keep existing clusters - incremental clustering will handle new notes
+        
+        // If clusters already exist, automatically use incremental clustering for imported notes
+        // This preserves existing clusters and intelligently slots new notes into them
+        // (same behavior as "adding a single note")
+        if (hasClustered && clusters.length > 0) {
+          setStatus({ isProcessing: true, message: 'Clustering imported notes into existing topics...' });
+          try {
+            const allNotes = [...notes, ...newNotes];
+            const updatedClusters = await incrementalCluster(allNotes, clusters);
+            setClusters(updatedClusters);
+            console.log(`✅ Imported ${newNotes.length} notes into existing clusters`);
+          } catch (e) {
+            console.error('Incremental clustering for imports failed:', e);
+            alert('Imported notes but clustering failed. Click "Cluster AI" to manually cluster.');
+          } finally {
+            setStatus({ isProcessing: false, message: '' });
+          }
+        }
       }
     } catch (error) {
       console.error("Error reading files", error);

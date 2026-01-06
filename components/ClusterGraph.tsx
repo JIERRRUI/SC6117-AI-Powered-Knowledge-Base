@@ -13,6 +13,9 @@ const processData = (clusters: ClusterNode[]) => {
   const links: any[] = [];
   const seenIds = new Set<string>(); // Track IDs to avoid duplicates
 
+  // Debug: Log input structure
+  console.log('📊 ClusterGraph input:', JSON.stringify(clusters, null, 2).substring(0, 2000));
+
   // Root node
   const rootId = 'graph-root';
   nodes.push({ id: rootId, name: 'Knowledge Base', type: 'root', level: 0, r: 35 });
@@ -22,6 +25,8 @@ const processData = (clusters: ClusterNode[]) => {
   const processCluster = (cluster: ClusterNode, parentId: string, level: number) => {
     // Create unique ID for this cluster to avoid collisions
     const clusterId = `cluster-L${level}-${cluster.id}`;
+    
+    console.log(`  Processing cluster: "${cluster.name}" (id: ${cluster.id}, type: ${cluster.type}, level: ${level}, children: ${cluster.children?.length || 0})`);
     
     // Skip if already processed (avoid duplicate nodes)
     if (seenIds.has(clusterId)) {
@@ -46,6 +51,7 @@ const processData = (clusters: ClusterNode[]) => {
 
     // Process children (can be notes or nested clusters)
     if (cluster.children) {
+      console.log(`    Children of "${cluster.name}":`, cluster.children.map(c => `${c.type}:${c.name}`).join(', '));
       cluster.children.forEach(child => {
         if (child.type === 'note') {
           // Create unique ID for note
@@ -81,6 +87,7 @@ const processData = (clusters: ClusterNode[]) => {
   });
 
   console.log(`📊 Graph data: ${nodes.length} nodes, ${links.length} links`);
+  console.log('📊 All nodes:', nodes.map(n => `${n.type}:${n.name}`).join(', '));
   return { nodes, links };
 };
 
