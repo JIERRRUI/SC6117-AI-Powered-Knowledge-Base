@@ -1,12 +1,44 @@
-
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Note, SearchMode, SearchResult, ProcessingStatus, ClusterNode } from './types';
 import { semanticSearchWithGemini, correctTextWithGemini } from './services/geminiService';
 import { incrementalCluster, fullSemanticClustering } from './services/clusteringService';
 import { executeExactSearch, executeHybridSearch } from './services/searchService';
 import { getAllNotes, saveNote, deleteNote, bulkSaveNotes } from './services/storageService';
-import { SearchIcon, FileTextIcon, NetworkIcon, ZapIcon, LayersIcon, ChevronRightIcon, ChevronDownIcon, FolderIcon, WifiOffIcon, UploadCloudIcon, XIcon, PlusIcon, WandIcon, TrashIcon, SaveIcon } from './components/Icons';
+import {
+  SearchIcon,
+  FileTextIcon,
+  NetworkIcon,
+  ZapIcon,
+  LayersIcon,
+  ChevronRightIcon,
+  ChevronDownIcon,
+  FolderIcon,
+  WifiOffIcon,
+  UploadCloudIcon,
+  XIcon,
+  PlusIcon,
+  WandIcon,
+  TrashIcon,
+  SaveIcon,
+  ExportPdfIcon
+} from './components/Icons';
 import ClusterGraph from './components/ClusterGraph';
+import ConfirmationModal from './components/ConfirmationModal';
+
+import * as pdfjsLib from 'pdfjs-dist';
+import mammoth from 'mammoth';
+import { jsPDF } from 'jspdf';
+
+// -----------------------------------------------------------------------------
+// PDF.js worker config (Vite-friendly)
+//
+// Using the bundled worker via `new URL(..., import.meta.url)` is the most robust
+// approach for Vite. Avoids CDN/CORS/version mismatch.
+// -----------------------------------------------------------------------------
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
 
 // --- Helper Functions for File Processing ---
 
@@ -14,48 +46,122 @@ import ClusterGraph from './components/ClusterGraph';
 const convertHtmlToMarkdown = (html: string): string => {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
-  
-  // Recursive function to traverse DOM and build Markdown
+
   const processNode = (node: Node): string => {
     if (node.nodeType === Node.TEXT_NODE) {
-      // Normalize whitespace but keep text
       return node.textContent?.replace(/\s+/g, ' ') || '';
     }
-    
+
     if (node.nodeType !== Node.ELEMENT_NODE) return '';
 
     const el = node as HTMLElement;
     const childrenContent = Array.from(el.childNodes).map(processNode).join('');
-    
-    // Simple HTML to Markdown mapping
+
     switch (el.tagName.toLowerCase()) {
-      case 'h1': return `\n# ${childrenContent}\n\n`;
-      case 'h2': return `\n## ${childrenContent}\n\n`;
-      case 'h3': return `\n### ${childrenContent}\n\n`;
-      case 'p': return `${childrenContent}\n\n`;
-      case 'div': return `${childrenContent}\n`; // OneNote often uses divs for lines
-      case 'ul': return `${childrenContent}\n`;
-      case 'ol': return `${childrenContent}\n`;
-      case 'li': return `- ${childrenContent.trim()}\n`;
-      case 'br': return '\n';
-      case 'b': 
-      case 'strong': return ` **${childrenContent.trim()}** `;
-      case 'i': 
-      case 'em': return ` *${childrenContent.trim()}* `;
-      case 'a': return ` [${childrenContent.trim()}](${(el as HTMLAnchorElement).href}) `;
-      case 'code': 
-      case 'pre': return ` \`${childrenContent}\` `;
-      case 'head': 
-      case 'style': 
-      case 'script': return ''; // Ignore metadata
-      case 'body': return childrenContent;
-      default: return childrenContent;
+      case 'h1':
+        return `\n# ${childrenContent}\n\n`;
+      case 'h2':
+        return `\n## ${childrenContent}\n\n`;
+      case 'h3':
+        return `\n### ${childrenContent}\n\n`;
+      case 'p':
+        return `${childrenContent}\n\n`;
+      case 'div':
+        return `${childrenContent}\n`;
+      case 'ul':
+      case 'ol':
+        return `${childrenContent}\n`;
+      case 'li':
+        return `- ${childrenContent.trim()}\n`;
+      case 'br':
+        return '\n';
+      case 'b':
+      case 'strong':
+        return ` **${childrenContent.trim()}** `;
+      case 'i':
+      case 'em':
+        return ` *${childrenContent.trim()}* `;
+      case 'a':
+        return ` [${childrenContent.trim()}](${(el as HTMLAnchorElement).href}) `;
+      case 'code':
+      case 'pre':
+        return ` \`${childrenContent}\` `;
+      case 'head':
+      case 'style':
+      case 'script':
+        return '';
+      case 'body':
+        return childrenContent;
+      default:
+        return childrenContent;
     }
   };
 
   const rawMarkdown = processNode(doc.body);
-  // Clean up excessive newlines
   return rawMarkdown.replace(/\n\s+\n/g, '\n\n').trim();
+};
+
+// Extract text from PDF
+const extractTextFromPdf = async (file: File): Promise<string> => {
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    let fullText = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = (textContent.items as any[])
+        .map((item: any) => item.str)
+        .join(' ');
+      fullText += `## Page ${i}\n\n${pageText}\n\n`;
+    }
+
+    return fullText;
+  } catch (err) {
+    console.error('PDF Extraction error:', err);
+    return 'Failed to extract text from PDF.';
+  }
+};
+
+// Convert Markdown to plain text for PDF export
+const markdownToPlainText = (markdown: string): string => {
+  return markdown
+    // Remove headers
+    .replace(/^#{1,6}\s+/gm, '')
+    // Remove bold/italic markers
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/_([^_]+)_/g, '$1')
+    // Remove inline code
+    .replace(/`([^`]+)`/g, '$1')
+    // Remove code blocks
+    .replace(/```[\s\S]*?```/g, '')
+    // Remove links, keep text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Remove images
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    // Remove blockquotes marker
+    .replace(/^>\s*/gm, '')
+    // Remove horizontal rules
+    .replace(/^[-*_]{3,}$/gm, '')
+    // Clean up multiple newlines
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+};
+
+// Extract Markdown from Word (DOCX)
+const extractTextFromDocx = async (file: File): Promise<string> => {
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    // Use type assertion as mammoth types may not include deprecated convertToMarkdown
+    const result = await (mammoth as any).convertToMarkdown({ arrayBuffer });
+    return result.value;
+  } catch (err) {
+    console.error('DOCX Extraction error:', err);
+    return 'Failed to extract text from Word document.';
+  }
 };
 
 // Extract readable text from binary files (like .one)
@@ -68,146 +174,48 @@ const extractTextFromBinary = async (file: File, noteTitle: string): Promise<str
   let currentRun = "";
   
   // Iterate through bytes to find sequences of printable ASCII characters
-  // Require longer runs (8+ chars) to reduce noise
+  // This mimics the unix 'strings' command
   for (let i = 0; i < bytes.length; i++) {
     const code = bytes[i];
-    // 32-126 are printable ASCII, 10 is LF, 13 is CR, 9 is Tab
     if ((code >= 32 && code <= 126) || code === 10 || code === 13 || code === 9) {
       currentRun += String.fromCharCode(code);
     } else {
-      // Require 8+ characters to filter more noise
-      if (currentRun.length >= 8) {
+      // If we have a run of 4+ characters, keep it
+      if (currentRun.length >= 4) {
         result += currentRun + "\n";
       }
       currentRun = "";
     }
   }
   // Add final run
-  if (currentRun.length >= 8) {
+  if (currentRun.length >= 4) {
     result += currentRun;
   }
   
-  // Helper: Check if a line looks like a real sentence/phrase
-  const looksLikeContent = (text: string): boolean => {
-    // Must have at least 2 words (contain a space with letters on both sides)
-    if (!/[a-zA-Z]+\s+[a-zA-Z]+/.test(text)) return false;
-    
-    // At least 60% should be letters or spaces
-    const letterAndSpaceCount = (text.match(/[a-zA-Z\s]/g) || []).length;
-    if (letterAndSpaceCount < text.length * 0.6) return false;
-    
-    // Must have reasonable word-like patterns (3+ letter sequences)
-    const words = text.match(/[a-zA-Z]{3,}/g) || [];
-    if (words.length < 2) return false;
-    
-    return true;
-  };
-  
-  // Filter out junk: remove timestamps, metadata markers, binary artifacts
-  const lines = result.split('\n');
-  const cleanLines: string[] = [];
-  const seenContent = new Set<string>(); // Track duplicates
-  
-  for (const line of lines) {
-    // Remove tabs and normalize whitespace
-    const trimmed = line.replace(/\t/g, ' ').replace(/\s+/g, ' ').trim();
-    
-    // Skip empty or very short lines
-    if (trimmed.length < 10) continue;
-    
-    // Skip timestamp patterns
-    if (/^\d{1,2}:\d{2}\s*(AM|PM)$/i.test(trimmed)) continue;
-    if (/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),/i.test(trimmed)) continue;
-    if (/^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i.test(trimmed)) continue;
-    
-    // Skip lines with common binary markers (brackets, pipes, tildes at edges)
-    if (/^[\[\]{}|~<>!@#$%^&*()_+=\-\\:;'"`,?\/]/.test(trimmed)) continue;
-    if (/[\[\]{}|~<>!@#$%^&*()_+=\-\\:;'"`,?\/]$/.test(trimmed)) continue;
-    
-    // Skip lines that don't look like real content (sentences/phrases)
-    if (!looksLikeContent(trimmed)) continue;
-    
-    // Deduplicate
-    if (seenContent.has(trimmed)) continue;
-    seenContent.add(trimmed);
-    
-    // Keep this line
-    cleanLines.push(trimmed);
-  }
-  
-  // Now find only content for the target note (by title match)
-  // OneNote stores notes with title followed by content
-  // Find the section that matches our title and extract only that content
-  const normalizedTitle = noteTitle.toLowerCase().trim();
-  let targetContent: string[] = [];
-  let foundTargetNote = false;
-  let lastTitleIndex = -1;
-  
-  // First pass: find the last occurrence of the target title (most recent version)
-  for (let i = 0; i < cleanLines.length; i++) {
-    const lineLower = cleanLines[i].toLowerCase();
-    if (lineLower.includes(normalizedTitle) || normalizedTitle.includes(lineLower.replace(/[^a-z0-9\s]/g, ''))) {
-      lastTitleIndex = i;
-    }
-  }
-  
-  // If we found the title, extract content after it until we hit another title-like line
-  if (lastTitleIndex >= 0) {
-    foundTargetNote = true;
-    // Skip the title line itself (we'll add it in the template)
-    for (let i = lastTitleIndex + 1; i < cleanLines.length; i++) {
-      const line = cleanLines[i];
-      const lineLower = line.toLowerCase();
-      
-      // Stop if we hit another note's title (short line that looks like a heading)
-      // A title is typically short (< 50 chars) and doesn't have sentence punctuation
-      const isLikelyTitle = line.length < 50 && !/[.!?]$/.test(line) && /^[A-Z]/.test(line);
-      
-      // Also stop if this line matches a different known heading pattern
-      if (isLikelyTitle && !lineLower.includes(normalizedTitle) && i > lastTitleIndex + 1) {
-        // Check if it looks like a new section (capitalized, no punctuation)
-        const wordCount = (line.match(/\s+/g) || []).length + 1;
-        if (wordCount <= 5) {
-          break; // Likely a new note title, stop here
-        }
-      }
-      
-      targetContent.push(line);
-    }
-  }
-  
-  // If we found target content, return it; otherwise return all clean content
-  if (foundTargetNote && targetContent.length > 0) {
-    return targetContent.join('\n').trim();
-  }
-  
-  // Fallback: return all clean content if we couldn't isolate the target note
-  const cleanContent = cleanLines.join('\n').trim();
-  
-  return cleanContent.length > 0 
-    ? cleanContent 
+  return result.length > 0 
+    ? result 
     : "Binary content detected but no readable text could be extracted.";
 };
 
 // --- Helper Component: Search Result Item ---
 
-interface SearchResultItemProps { 
-  result: SearchResult; 
-  onClick: () => void; 
+interface SearchResultItemProps {
+  result: SearchResult;
+  onClick: () => void;
 }
 
-const SearchResultItem: React.FC<SearchResultItemProps> = ({ 
-  result, 
-  onClick 
-}) => (
-  <div 
+const SearchResultItem: React.FC<SearchResultItemProps> = ({ result, onClick }) => (
+  <div
     onClick={onClick}
     className="p-3 mb-2 rounded bg-surface border border-border hover:border-primary cursor-pointer transition-colors group"
   >
     <div className="flex justify-between items-start">
-      <h4 className="font-semibold text-text group-hover:text-primary transition-colors">{result.note.title}</h4>
+      <h4 className="font-semibold text-text group-hover:text-primary transition-colors">
+        {result.note.title}
+      </h4>
       <span className="text-xs font-mono px-2 py-0.5 rounded bg-black/30 text-muted">
-        {Math.round(result.score)}{result.reason ? '/100' : ''}
+        {Math.round(result.score)}
+        {result.reason ? '/100' : ''}
       </span>
     </div>
     {result.highlight ? (
@@ -227,7 +235,10 @@ const SearchResultItem: React.FC<SearchResultItemProps> = ({
     )}
     <div className="mt-2 flex gap-2">
       {result.note.tags.map(tag => (
-        <span key={tag} className="text-[10px] uppercase font-bold tracking-wider text-muted bg-border/50 px-1.5 py-0.5 rounded">
+        <span
+          key={tag}
+          className="text-[10px] uppercase font-bold tracking-wider text-muted bg-border/50 px-1.5 py-0.5 rounded"
+        >
           {tag}
         </span>
       ))}
@@ -237,44 +248,48 @@ const SearchResultItem: React.FC<SearchResultItemProps> = ({
 
 // --- Helper Component: File Tree Node ---
 
-interface FileTreeNodeProps { 
-  node: ClusterNode; 
-  depth?: number; 
-  activeId?: string; 
+interface FileTreeNodeProps {
+  node: ClusterNode;
+  depth?: number;
+  activeId?: string;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
-const FileTreeNode: React.FC<FileTreeNodeProps> = ({ 
-  node, 
-  depth = 0, 
-  activeId, 
+const FileTreeNode: React.FC<FileTreeNodeProps> = ({
+  node,
+  depth = 0,
+  activeId,
   onSelect,
   onDelete
 }) => {
   const [expanded, setExpanded] = useState(true);
-  
+
   if (node.type === 'note') {
     return (
-      <div 
+      <div
         onClick={() => node.noteId && onSelect(node.noteId)}
-        className={`group flex items-center gap-2 py-1 px-2 cursor-pointer text-sm transition-colors ${activeId === node.noteId ? 'bg-primary/20 text-primary' : 'text-muted hover:text-text hover:bg-white/5'}`}
+        className={`group flex items-center gap-2 py-1 px-2 cursor-pointer text-sm transition-colors ${
+          activeId === node.noteId
+            ? 'bg-primary/20 text-primary'
+            : 'text-muted hover:text-text hover:bg-white/5'
+        }`}
         style={{ paddingLeft: `${depth * 16 + 12}px` }}
       >
         <FileTextIcon className="w-4 h-4 opacity-70" />
         <span className="truncate flex-1">{node.name}</span>
         {node.noteId && (
-            <button
-                onClick={(e) => {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    onDelete(node.noteId!);
-                }}
-                className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 hover:text-red-400 text-muted transition-all rounded"
-                title="Delete note"
-            >
-                <TrashIcon className="w-3 h-3" />
-            </button>
+          <button
+            onClick={e => {
+              e.stopPropagation();
+              e.preventDefault();
+              onDelete(node.noteId!);
+            }}
+            className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 hover:text-red-400 text-muted transition-all rounded"
+            title="Delete note"
+          >
+            <TrashIcon className="w-3 h-3" />
+          </button>
         )}
       </div>
     );
@@ -282,24 +297,28 @@ const FileTreeNode: React.FC<FileTreeNodeProps> = ({
 
   return (
     <div>
-      <div 
+      <div
         onClick={() => setExpanded(!expanded)}
         className="flex items-center gap-1 py-1 px-2 cursor-pointer text-sm text-text hover:bg-white/5 transition-colors font-medium select-none"
         style={{ paddingLeft: `${depth * 16}px` }}
       >
-        {expanded ? <ChevronDownIcon className="w-4 h-4 text-muted" /> : <ChevronRightIcon className="w-4 h-4 text-muted" />}
+        {expanded ? (
+          <ChevronDownIcon className="w-4 h-4 text-muted" />
+        ) : (
+          <ChevronRightIcon className="w-4 h-4 text-muted" />
+        )}
         <FolderIcon className="w-4 h-4 text-primary" />
         <span className="truncate">{node.name}</span>
       </div>
       {expanded && node.children && (
         <div>
           {node.children.map(child => (
-            <FileTreeNode 
-              key={child.id} 
-              node={child} 
-              depth={depth + 1} 
-              activeId={activeId} 
-              onSelect={onSelect} 
+            <FileTreeNode
+              key={child.id}
+              node={child}
+              depth={depth + 1}
+              activeId={activeId}
+              onSelect={onSelect}
               onDelete={onDelete}
             />
           ))}
@@ -326,9 +345,7 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      onUpload(e.dataTransfer.files);
-    }
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) onUpload(e.dataTransfer.files);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -347,12 +364,10 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
         <button 
           onClick={onClose}
           className="absolute top-4 right-4 text-muted hover:text-white transition-colors"
-          title="Close import dialog"
-          aria-label="Close import dialog"
         >
           <XIcon className="w-5 h-5" />
         </button>
-        
+
         <div className="p-8 text-center">
           <div className="mx-auto w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mb-6 text-primary">
             <UploadCloudIcon className="w-8 h-8" />
@@ -360,31 +375,31 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
           <h2 className="text-2xl font-bold text-text mb-2">Import Notes</h2>
           <p className="text-muted text-sm mb-8">
             Upload notes to add them to your knowledge base.
-            <br/>
-            Supports <b>Markdown, Text, OneNote (.one), and HTML</b>.
+            <br />
+            Supports <b>Markdown, Text, PDF, Word (.docx), OneNote (.one), and HTML</b>.
           </p>
 
-          <div 
-            className={`border-2 border-dashed rounded-lg p-10 transition-colors cursor-pointer ${isDragging ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50 hover:bg-white/5'}`}
+          <div
+            className={`border-2 border-dashed rounded-lg p-10 transition-colors cursor-pointer ${
+              isDragging ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50 hover:bg-white/5'
+            }`}
             onDrop={handleDrop}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onClick={() => fileInputRef.current?.click()}
           >
-            <input 
-              type="file" 
+            <input
+              type="file"
               ref={fileInputRef}
               className="hidden" 
               multiple 
               accept=".md,.txt,.markdown,.html,.htm,.one"
-              aria-label="Upload notes files"
-              title="Upload notes files"
               onChange={(e) => {
                 if (e.target.files) onUpload(e.target.files);
               }}
             />
             <p className="text-sm font-medium text-text">Click to browse or drag files here</p>
-            <p className="text-xs text-muted mt-2">.md, .txt, .html, .one</p>
+            <p className="text-xs text-muted mt-2">.md, .txt, .html, .one, .pdf, .docx</p>
           </div>
         </div>
         <div className="bg-black/20 p-4 text-center text-xs text-muted border-t border-border">
@@ -395,10 +410,9 @@ const UploadModal: React.FC<UploadModalProps> = ({ isOpen, onClose, onUpload }) 
   );
 };
 
-
 const App = () => {
   // State
-  const [notes, setNotes] = useState<Note[]>([]); // Initialize empty, load from DB
+  const [notes, setNotes] = useState<Note[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchMode, setSearchMode] = useState<SearchMode>(SearchMode.EXACT);
@@ -409,7 +423,13 @@ const App = () => {
   const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
   const [isDbLoaded, setIsDbLoaded] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  
+
+  // IMPORTANT FIX: keep latest notes available for async saves
+  const notesRef = useRef<Note[]>([]);
+  useEffect(() => {
+    notesRef.current = notes;
+  }, [notes]);
+
   // Clustering State
   const [clusters, setClusters] = useState<ClusterNode[]>([]);
   const [hasClustered, setHasClustered] = useState(false);
@@ -431,9 +451,62 @@ const App = () => {
       if (!groups[folder]) groups[folder] = [];
       groups[folder].push(note);
     });
-    // Sort folders alphabetically
     return Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0]));
   }, [notes]);
+
+  const [moveRequest, setMoveRequest] = useState<{
+    noteId: string;
+    noteTitle: string;
+    targetClusterId: string;
+    targetClusterName: string;
+  } | null>(null);
+
+  const handleNodeReparent = (noteId: string, newClusterId: string, newClusterName: string) => {
+    const targetNote = notes.find(n => n.id === noteId);
+    if (!targetNote) return;
+
+    setMoveRequest({
+      noteId,
+      noteTitle: targetNote.title,
+      targetClusterId: newClusterId,
+      targetClusterName: newClusterName
+    });
+  };
+
+  const executeMove = async () => {
+    if (!moveRequest) return;
+    const { noteId, targetClusterName, targetClusterId } = moveRequest;
+
+    const newFolderPath = `/${targetClusterName.replace(/[\\/:*?"<>|]/g, '')}`;
+
+    await handleUpdateNote(noteId, 'folder', newFolderPath);
+
+    setClusters(prev => {
+      return prev.map(cluster => {
+        if (cluster.children?.some(c => c.noteId === noteId) && cluster.id !== targetClusterId) {
+          return {
+            ...cluster,
+            children: cluster.children.filter(c => c.noteId !== noteId)
+          };
+        }
+        if (cluster.id === targetClusterId) {
+          const noteNode = {
+            id: `node-${noteId}`,
+            name: moveRequest.noteTitle,
+            type: 'note' as const,
+            noteId
+          };
+          return {
+            ...cluster,
+            children: [...(cluster.children || []), noteNode]
+          };
+        }
+        return cluster;
+      });
+    });
+
+    setMoveRequest(null);
+  };
 
   // Load notes from DB on startup
   useEffect(() => {
@@ -442,11 +515,10 @@ const App = () => {
         const storedNotes = await getAllNotes();
         setNotes(storedNotes);
         setIsDbLoaded(true);
-        // Default expand all folders
         const allFolders = new Set(storedNotes.map(n => n.folder || '/misc'));
         setExpandedFolders(allFolders);
       } catch (e) {
-        console.error("Failed to load notes", e);
+        console.error('Failed to load notes', e);
         setStatus({ isProcessing: false, message: 'Error loading database' });
       }
     };
@@ -458,10 +530,7 @@ const App = () => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => {
       setIsOnline(false);
-      // Auto-switch to exact search if offline
-      if (searchMode !== SearchMode.EXACT) {
-        setSearchMode(SearchMode.EXACT);
-      }
+      if (searchMode !== SearchMode.EXACT) setSearchMode(SearchMode.EXACT);
     };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -471,7 +540,6 @@ const App = () => {
     };
   }, [searchMode]);
 
-  // Handlers
   const handleSearch = useCallback(async () => {
     const trimmed = searchQuery.trim();
     if (!trimmed) {
@@ -481,15 +549,13 @@ const App = () => {
 
     const effectiveMode = !isOnline ? SearchMode.EXACT : searchMode;
 
-    if (!isOnline && searchMode !== SearchMode.EXACT) {
-      setSearchMode(SearchMode.EXACT);
-    }
+    if (!isOnline && searchMode !== SearchMode.EXACT) setSearchMode(SearchMode.EXACT);
 
     setStatus({
       isProcessing: true,
       message: effectiveMode === SearchMode.EXACT ? 'Searching...' : 'Searching with hybrid AI...'
     });
-    
+
     try {
       const results: SearchResult[] =
         effectiveMode === SearchMode.EXACT
@@ -505,7 +571,6 @@ const App = () => {
     }
   }, [searchQuery, searchMode, notes, isOnline]);
 
-  // Debounce search (hybrid/semantic are heavier)
   useEffect(() => {
     if (!searchQuery.trim()) {
       setSearchResults([]);
@@ -515,7 +580,6 @@ const App = () => {
     return () => clearTimeout(timer);
   }, [searchQuery, searchMode, handleSearch]);
 
-  // Trigger Semantic/Hybrid Search on Enter or Button
   const triggerSemanticSearch = () => {
     handleSearch();
   };
@@ -571,7 +635,7 @@ const App = () => {
   const processFiles = async (files: FileList) => {
     setIsUploadModalOpen(false);
     setStatus({ isProcessing: true, message: 'Importing notes...' });
-    
+
     const newNotes: Note[] = [];
     const dateStr = new Date().toISOString().split('T')[0];
 
@@ -580,21 +644,15 @@ const App = () => {
         const file = files[i];
         let content = '';
         const name = file.name;
-        // Basic Title Extraction
-        let title = name.replace(/\.(md|txt|html|htm|one|markdown)$/i, '');
 
-        // Handle Different File Types
+        let title = name.replace(/\.(md|txt|html|htm|one|markdown|pdf|docx)$/i, '');
+
         if (name.match(/\.(md|txt|markdown)$/i)) {
           const text = await file.text();
           content = text;
-          // Try to get title from first line # Heading
           const firstLine = text.split('\n')[0].trim();
-          if (firstLine.startsWith('# ')) {
-            title = firstLine.substring(2);
-          }
-        } 
-        else if (name.match(/\.(html|htm)$/i)) {
-          // HTML Import (e.g. OneNote export)
+          if (firstLine.startsWith('# ')) title = firstLine.substring(2);
+        } else if (name.match(/\.(html|htm)$/i)) {
           const rawHtml = await file.text();
           content = convertHtmlToMarkdown(rawHtml);
           // Prepend title if not present
@@ -603,7 +661,7 @@ const App = () => {
           }
         } 
         else if (name.match(/\.one$/i)) {
-          // OneNote Binary Import - extract only the content for this specific note
+          // OneNote Binary Import
           const extractedText = await extractTextFromBinary(file, title);
           content = `# ${title}\n\n${extractedText}`;
         }
@@ -619,41 +677,24 @@ const App = () => {
           });
         }
       }
-      
+
       if (newNotes.length > 0) {
-        // Save to DB
         await bulkSaveNotes(newNotes);
-        // Update State
         setNotes(prev => [...prev, ...newNotes]);
         setExpandedFolders(prev => new Set(prev).add('/uploads'));
-        
-        // If clusters already exist, automatically use incremental clustering for imported notes
-        // This preserves existing clusters and intelligently slots new notes into them
-        // (same behavior as "adding a single note")
-        if (hasClustered && clusters.length > 0) {
-          setStatus({ isProcessing: true, message: 'Clustering imported notes into existing topics...' });
-          try {
-            const allNotes = [...notes, ...newNotes];
-            const updatedClusters = await incrementalCluster(allNotes, clusters);
-            setClusters(updatedClusters);
-            console.log(`✅ Imported ${newNotes.length} notes into existing clusters`);
-          } catch (e) {
-            console.error('Incremental clustering for imports failed:', e);
-            alert('Imported notes but clustering failed. Click "Cluster AI" to manually cluster.');
-          } finally {
-            setStatus({ isProcessing: false, message: '' });
-          }
+        // Reset clustering
+        if (hasClustered) {
+          setHasClustered(false);
+          setClusters([]);
         }
       }
     } catch (error) {
-      console.error("Error reading files", error);
-      alert("Failed to import some files.");
+      console.error('Error reading files', error);
+      alert('Failed to import some files.');
     } finally {
       setStatus({ isProcessing: false, message: '' });
     }
   };
-
-  // --- CRUD & AI Operations ---
 
   const handleCreateNote = async () => {
     const newNote: Note = {
@@ -664,41 +705,37 @@ const App = () => {
       createdAt: new Date().toISOString().split('T')[0],
       folder: '/drafts'
     };
-    
-    // Optimistic Update
+
     setNotes(prev => [newNote, ...prev]);
     setActiveNoteId(newNote.id);
     setViewMode('editor');
     setExpandedFolders(prev => new Set(prev).add('/drafts'));
-    // Note: Keep existing clusters - incremental clustering will handle the new note
+    
+    if (hasClustered) {
+        setHasClustered(false);
+        setClusters([]);
+    }
 
-    // Persist
     try {
       await saveNote(newNote);
     } catch (e) {
-      console.error("Failed to save new note", e);
-      alert("Could not save note to database");
+      console.error('Failed to save new note', e);
+      alert('Could not save note to database');
     }
   };
 
-  const handleUpdateNote = async (id: string, field: 'title' | 'content', value: string) => {
-    // 1. Update React State immediately for UI responsiveness
-    setNotes(prev => {
-        const updated = prev.map(note => 
-            note.id === id ? { ...note, [field]: value } : note
-        );
-        return updated;
-    });
+  // FIX: uses notesRef to avoid stale saves
+  const handleUpdateNote = async (id: string, field: 'title' | 'content' | 'folder', value: string) => {
+    setNotes(prev => prev.map(note => (note.id === id ? { ...note, [field]: value } : note)));
 
-    // 2. Background Save
-    const noteToUpdate = notes.find(n => n.id === id);
-    if (noteToUpdate) {
-        const updatedNote = { ...noteToUpdate, [field]: value };
-        try {
-            await saveNote(updatedNote);
-        } catch (e) {
-            console.error("Background save failed", e);
-        }
+    const current = notesRef.current.find(n => n.id === id);
+    if (!current) return;
+
+    const updatedNote = { ...current, [field]: value };
+    try {
+      await saveNote(updatedNote);
+    } catch (e) {
+      console.error('Background save failed', e);
     }
   };
 
@@ -706,12 +743,65 @@ const App = () => {
     if (!activeNote) return;
     setIsSaving(true);
     try {
-        await saveNote(activeNote);
-        setTimeout(() => setIsSaving(false), 1000); // Reset "Saved" text after 1s
+      await saveNote(activeNote);
+      setTimeout(() => setIsSaving(false), 1000);
     } catch (e) {
-        console.error("Manual save failed", e);
-        setIsSaving(false);
-        alert("Failed to save");
+      console.error('Manual save failed', e);
+      setIsSaving(false);
+      alert('Failed to save');
+    }
+  };
+
+  const handleExportPdf = () => {
+    if (!activeNote) return;
+
+    try {
+      const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+
+      const margin = 48;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const maxWidth = pageWidth - margin * 2;
+
+      const safeTitle = (activeNote.title || 'note')
+        .replace(/[\\/:*?"<>|]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      // Header
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(18);
+      const titleLines = doc.splitTextToSize(safeTitle || 'Untitled Note', maxWidth);
+      let y = margin;
+      doc.text(titleLines, margin, y);
+
+      y += titleLines.length * 22;
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10);
+      const meta = `${activeNote.folder || ''}  •  ${activeNote.createdAt || ''}`;
+      doc.text(meta, margin, y);
+      y += 18;
+
+      // Body
+      doc.setFontSize(11);
+      const bodyText = markdownToPlainText(activeNote.content || '');
+      const bodyLines = doc.splitTextToSize(bodyText, maxWidth);
+
+      const lineHeight = 16;
+      for (let i = 0; i < bodyLines.length; i++) {
+        if (y + lineHeight > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        doc.text(bodyLines[i], margin, y);
+        y += lineHeight;
+      }
+
+      doc.save(`${safeTitle || 'note'}.pdf`);
+    } catch (e) {
+      console.error('Export PDF failed', e);
+      alert('Failed to export PDF. Check console.');
     }
   };
 
@@ -722,15 +812,17 @@ const App = () => {
         if (activeNoteId === id) {
             setActiveNoteId(null);
         }
-        // Note: Keep existing clusters - next clustering will handle the deletion
-
-        // Persist delete
-        try {
-            await deleteNote(id);
-        } catch (e) {
-            console.error("Delete failed", e);
-            alert("Failed to delete from database. Refreshing page might restore it.");
+        if (hasClustered) {
+            setHasClustered(false);
+            setClusters([]);
         }
+
+      try {
+        await deleteNote(id);
+      } catch (e) {
+        console.error('Delete failed', e);
+        alert('Failed to delete from database. Refreshing page might restore it.');
+      }
     }
   };
 
@@ -741,8 +833,8 @@ const App = () => {
       const correctedText = await correctTextWithGemini(activeNote.content);
       await handleUpdateNote(activeNote.id, 'content', correctedText);
     } catch (e) {
-      console.error("Correction failed", e);
-      alert("AI Correction failed.");
+      console.error('Correction failed', e);
+      alert('AI Correction failed.');
     } finally {
       setStatus({ isProcessing: false, message: '' });
     }
@@ -757,7 +849,7 @@ const App = () => {
     });
   };
 
-  // Memoize the ClusterGraph callback to prevent re-renders when parent updates
+  // Memoized callback for ClusterGraph to prevent re-renders on keystroke
   const handleSelectNoteFromGraph = useCallback((id: string) => {
     setActiveNoteId(id);
     setViewMode('editor');
@@ -782,10 +874,7 @@ const App = () => {
             <h2 className="text-xl font-bold flex items-center gap-2">
               <NetworkIcon className="text-primary" /> Knowledge Graph
             </h2>
-            <button 
-              onClick={() => setViewMode('editor')}
-              className="text-sm text-muted hover:text-text"
-            >
+            <button onClick={() => setViewMode('editor')} className="text-sm text-muted hover:text-text">
               Close Graph
             </button>
           </div>
@@ -804,62 +893,80 @@ const App = () => {
         <div className="h-full flex flex-col max-w-3xl mx-auto w-full p-6">
           <div className="mb-6">
             <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2 text-sm text-muted">
-                    <span>{activeNote.folder}</span>
-                    <span>/</span>
-                    <span>{activeNote.createdAt}</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button 
-                    onClick={handleManualSave}
-                    disabled={isSaving}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors text-xs font-medium border ${isSaving ? 'bg-green-500/10 text-green-500 border-green-500/20' : 'bg-primary/10 text-primary hover:bg-primary/20 border-primary/20'}`}
-                    title="Save Note"
+              <div className="flex items-center gap-2 text-sm text-muted">
+                <span>{activeNote.folder}</span>
+                <span>/</span>
+                <span>{activeNote.createdAt}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleManualSave}
+                  disabled={isSaving}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full transition-colors text-xs font-medium border ${
+                    isSaving
+                      ? 'bg-green-500/10 text-green-500 border-green-500/20'
+                      : 'bg-primary/10 text-primary hover:bg-primary/20 border-primary/20'
+                  }`}
+                  title="Save Note"
+                >
+                  <SaveIcon className="w-3 h-3" />
+                  {isSaving ? 'Saved' : 'Save'}
+                </button>
+
+                <button
+                  onClick={handleExportPdf}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors text-xs font-medium border border-emerald-500/20"
+                  title="Export this note to PDF"
+                >
+                  <ExportPdfIcon className="w-3 h-3" />
+                  Export PDF
+                </button>
+
+                {isOnline && (
+                  <button
+                    onClick={handleAICorrect}
+                    disabled={status.isProcessing}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-secondary/10 text-secondary hover:bg-secondary/20 transition-colors text-xs font-medium border border-secondary/20"
+                    title="Fix grammar, spelling and punctuation"
                   >
-                     <SaveIcon className="w-3 h-3" />
-                     {isSaving ? 'Saved' : 'Save'}
+                    <WandIcon className="w-3 h-3" />
+                    {status.isProcessing && status.message.includes('Fixing') ? 'Polishing...' : 'AI Fix Grammar'}
                   </button>
-                  {isOnline && (
-                      <button 
-                          onClick={handleAICorrect}
-                          disabled={status.isProcessing}
-                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-secondary/10 text-secondary hover:bg-secondary/20 transition-colors text-xs font-medium border border-secondary/20"
-                          title="Fix grammar, spelling and punctuation"
-                      >
-                        <WandIcon className="w-3 h-3" />
-                        {status.isProcessing && status.message.includes('Fixing') ? 'Polishing...' : 'AI Fix Grammar'}
-                      </button>
-                  )}
-                  <button 
-                    onClick={() => handleDeleteNote(activeNote.id)}
-                    className="p-1.5 rounded-full hover:bg-red-500/10 hover:text-red-400 text-muted transition-colors"
-                    title="Delete Note"
-                  >
-                    <TrashIcon className="w-4 h-4" />
-                  </button>
-                </div>
+                )}
+                <button
+                  onClick={() => handleDeleteNote(activeNote.id)}
+                  className="p-1.5 rounded-full hover:bg-red-500/10 hover:text-red-400 text-muted transition-colors"
+                  title="Delete Note"
+                >
+                  <TrashIcon className="w-4 h-4" />
+                </button>
+              </div>
             </div>
-            
-            <input 
+
+            <input
               className="w-full bg-transparent text-4xl font-bold text-text mb-4 focus:outline-none placeholder-gray-600"
               value={activeNote.title}
-              onChange={(e) => handleUpdateNote(activeNote.id, 'title', e.target.value)}
+              onChange={e => handleUpdateNote(activeNote.id, 'title', e.target.value)}
               placeholder="Note Title"
             />
 
             <div className="flex gap-2 mb-6">
               {activeNote.tags.map(tag => (
-                <span key={tag} className="text-xs font-medium px-2 py-1 rounded bg-primary/10 text-primary uppercase tracking-wide">
+                <span
+                  key={tag}
+                  className="text-xs font-medium px-2 py-1 rounded bg-primary/10 text-primary uppercase tracking-wide"
+                >
                   #{tag}
                 </span>
               ))}
             </div>
           </div>
+
           <div className="flex-1 h-full">
-            <textarea 
+            <textarea
               className="w-full h-full bg-transparent resize-none focus:outline-none font-mono text-sm leading-relaxed text-slate-300"
               value={activeNote.content}
-              onChange={(e) => handleUpdateNote(activeNote.id, 'content', e.target.value)}
+              onChange={e => handleUpdateNote(activeNote.id, 'content', e.target.value)}
               placeholder="Write your note here..."
             />
           </div>
@@ -877,7 +984,7 @@ const App = () => {
 
   return (
     <div className="flex h-screen w-full bg-background text-text overflow-hidden">
-
+      
       <UploadModal 
         isOpen={isUploadModalOpen} 
         onClose={() => setIsUploadModalOpen(false)} 
@@ -905,29 +1012,29 @@ const App = () => {
 
         {/* Action Bar */}
         <div className="p-2 border-b border-border grid grid-cols-2 gap-2">
-           <button 
-             onClick={handleCreateNote}
-             className="col-span-2 flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-primary hover:bg-blue-600 text-white shadow-lg shadow-blue-900/20"
+          <button
+            onClick={handleCreateNote}
+            className="col-span-2 flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-primary hover:bg-blue-600 text-white shadow-lg shadow-blue-900/20"
           >
             <PlusIcon className="w-3 h-3" />
             New Note
           </button>
-          <button 
-             onClick={() => setIsUploadModalOpen(true)}
-             className="flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-white/5 hover:bg-white/10 text-muted hover:text-white"
+          <button
+            onClick={() => setIsUploadModalOpen(true)}
+            className="flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all bg-white/5 hover:bg-white/10 text-muted hover:text-white"
           >
             <UploadCloudIcon className="w-3 h-3" />
             Import
           </button>
-          <button 
+          <button
             onClick={handleCluster}
             disabled={status.isProcessing || !isOnline}
             className={`flex items-center justify-center gap-2 p-2 rounded text-xs font-bold transition-all ${
               viewMode === 'graph' ? 'bg-secondary text-white' : 
               !isOnline ? 'bg-white/5 text-muted cursor-not-allowed opacity-50' :
-              'bg-white/5 hover:bg-white/10 text-muted hover:text-white'
+              'bg-white/5 hover:bg-white/10 text-muted'
             }`}
-            title={!isOnline ? "Unavailable offline" : hasClustered ? "View knowledge graph" : "Cluster notes with AI"}
+            title={!isOnline ? "Unavailable offline" : "Cluster AI"}
           >
             <NetworkIcon className="w-3 h-3" />
             {status.isProcessing && !hasClustered ? 'Clustering...' : 
@@ -936,93 +1043,104 @@ const App = () => {
           </button>
         </div>
 
-        {/* File Explorer (Auto-generated from clusters or grouped folder list) */}
+        {/* File Explorer */}
         <div className="flex-1 overflow-y-auto p-2">
           <div className="text-xs font-bold text-muted uppercase tracking-wider mb-2 pl-2">
             {clusters.length > 0 ? 'AI Clusters' : 'Files'}
           </div>
-          
+
           {!isDbLoaded ? (
             <div className="pl-2 text-xs text-muted">Loading database...</div>
           ) : clusters.length > 0 ? (
             <div className="space-y-1">
               {clusters.map(cluster => (
-                <FileTreeNode 
-                  key={cluster.id} 
-                  node={cluster} 
-                  activeId={activeNoteId || ''} 
-                  onSelect={(id) => {
+                <FileTreeNode
+                  key={cluster.id}
+                  node={cluster}
+                  activeId={activeNoteId || ''}
+                  onSelect={id => {
                     setActiveNoteId(id);
                     setViewMode('editor');
-                  }} 
+                  }}
                   onDelete={handleDeleteNote}
                 />
               ))}
             </div>
           ) : (
-             // Grouped by Folder
-             <div className="space-y-1">
-               {notesByFolder.map(([folder, folderNotes]) => {
-                 const isExpanded = expandedFolders.has(folder);
-                 return (
-                   <div key={folder}>
-                     <div 
-                        onClick={() => toggleFolder(folder)}
-                        className="flex items-center gap-1 py-1 px-2 cursor-pointer text-sm text-text hover:bg-white/5 transition-colors font-medium select-none"
-                     >
-                       {isExpanded ? <ChevronDownIcon className="w-4 h-4 text-muted" /> : <ChevronRightIcon className="w-4 h-4 text-muted" />}
-                       <FolderIcon className="w-4 h-4 text-primary" />
-                       <span className="truncate">{folder.replace(/^\//, '')}</span>
-                     </div>
-                     
-                     {isExpanded && (
-                       <div className="pl-3 border-l border-border ml-3 mt-1 space-y-1">
-                         {folderNotes.map(note => (
-                           <div 
-                             key={note.id}
-                             onClick={() => { setActiveNoteId(note.id); setViewMode('editor'); }}
-                             className={`group flex items-center gap-2 p-1.5 rounded cursor-pointer text-sm ${activeNoteId === note.id ? 'bg-primary/20 text-primary' : 'text-muted hover:text-text'}`}
-                           >
-                             <FileTextIcon className="w-4 h-4 opacity-70" />
-                             <span className="truncate flex-1">{note.title}</span>
-                             <button
-                                  onClick={(e) => {
-                                      e.stopPropagation();
-                                      e.preventDefault();
-                                      handleDeleteNote(note.id);
-                                  }}
-                                  className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 hover:text-red-400 text-muted transition-all rounded z-10"
-                                  title="Delete note"
-                              >
-                                  <TrashIcon className="w-3 h-3" />
-                              </button>
-                           </div>
-                         ))}
-                       </div>
-                     )}
-                   </div>
-                 );
-               })}
-             </div>
+            <div className="space-y-1">
+              {notesByFolder.map(([folder, folderNotes]) => {
+                const isExpanded = expandedFolders.has(folder);
+                return (
+                  <div key={folder}>
+                    <div
+                      onClick={() => toggleFolder(folder)}
+                      className="flex items-center gap-1 py-1 px-2 cursor-pointer text-sm text-text hover:bg-white/5 transition-colors font-medium select-none"
+                    >
+                      {isExpanded ? (
+                        <ChevronDownIcon className="w-4 h-4 text-muted" />
+                      ) : (
+                        <ChevronRightIcon className="w-4 h-4 text-muted" />
+                      )}
+                      <FolderIcon className="w-4 h-4 text-primary" />
+                      <span className="truncate">{folder.replace(/^\//, '')}</span>
+                    </div>
+
+                    {isExpanded && (
+                      <div className="pl-3 border-l border-border ml-3 mt-1 space-y-1">
+                        {folderNotes.map(note => (
+                          <div
+                            key={note.id}
+                            onClick={() => {
+                              setActiveNoteId(note.id);
+                              setViewMode('editor');
+                            }}
+                            className={`group flex items-center gap-2 p-1.5 rounded cursor-pointer text-sm ${
+                              activeNoteId === note.id ? 'bg-primary/20 text-primary' : 'text-muted hover:text-text'
+                            }`}
+                          >
+                            <FileTextIcon className="w-4 h-4 opacity-70" />
+                            <span className="truncate flex-1">{note.title}</span>
+                            <button
+                              onClick={e => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                handleDeleteNote(note.id);
+                              }}
+                              className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-red-500/20 hover:text-red-400 text-muted transition-all rounded z-10"
+                              title="Delete note"
+                            >
+                              <TrashIcon className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       </div>
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-w-0">
-        
         {/* Top Search Bar */}
         <div className="h-16 border-b border-border flex items-center px-6 gap-4 bg-background/50 backdrop-blur-sm z-20 sticky top-0">
           <div className="relative flex-1 max-w-2xl group">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <SearchIcon className={`w-5 h-5 transition-colors ${status.isProcessing ? 'text-primary animate-pulse' : 'text-muted group-focus-within:text-text'}`} />
+              <SearchIcon
+                className={`w-5 h-5 transition-colors ${
+                  status.isProcessing ? 'text-primary animate-pulse' : 'text-muted group-focus-within:text-text'
+                }`}
+              />
             </div>
             <input
               type="text"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && triggerSemanticSearch()}
-              placeholder={searchMode === SearchMode.EXACT ? "Grep search..." : "Ask your knowledge base..."}
+              onChange={e => setSearchQuery(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && triggerSemanticSearch()}
+              placeholder={searchMode === SearchMode.EXACT ? 'Grep search...' : 'Ask your knowledge base...'}
               className="block w-full pl-10 pr-3 py-2 bg-surface border border-border rounded-lg leading-5 text-text placeholder-gray-500 focus:outline-none focus:bg-background focus:border-primary focus:ring-1 focus:ring-primary sm:text-sm transition-all"
             />
             {searchQuery && (
@@ -1031,7 +1149,7 @@ const App = () => {
               </div>
             )}
           </div>
-          
+
           <button
             onClick={handleSearch}
             className="px-4 py-2 bg-primary hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors shadow-lg shadow-blue-900/20 flex items-center gap-2"
@@ -1042,7 +1160,9 @@ const App = () => {
           <div className="flex bg-surface rounded-lg p-1 border border-border">
             <button
               onClick={() => setSearchMode(SearchMode.EXACT)}
-              className={`px-3 py-1.5 rounded text-xs font-medium transition-all ${searchMode === SearchMode.EXACT ? 'bg-border text-white shadow-sm' : 'text-muted hover:text-text'}`}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-all ${
+                searchMode === SearchMode.EXACT ? 'bg-border text-white shadow-sm' : 'text-muted hover:text-text'
+              }`}
             >
               Exact
             </button>
@@ -1050,31 +1170,34 @@ const App = () => {
               onClick={() => isOnline && setSearchMode(SearchMode.HYBRID)}
               disabled={!isOnline}
               className={`px-3 py-1.5 rounded text-xs font-medium transition-all flex items-center gap-1 ${
-                searchMode === SearchMode.HYBRID ? 'bg-gradient-to-r from-primary to-secondary text-white shadow-sm' : 
-                !isOnline ? 'text-muted/50 cursor-not-allowed' : 'text-muted hover:text-text'
+                searchMode === SearchMode.HYBRID
+                  ? 'bg-gradient-to-r from-primary to-secondary text-white shadow-sm'
+                  : !isOnline
+                  ? 'text-muted/50 cursor-not-allowed'
+                  : 'text-muted hover:text-text'
               }`}
-              title={!isOnline ? "Unavailable offline" : "Enable Semantic AI Search"}
+              title={!isOnline ? 'Unavailable offline' : 'Enable Semantic AI Search'}
             >
               <ZapIcon className="w-3 h-3" /> AI Hybrid
             </button>
           </div>
         </div>
 
-        {/* Search Results Dropdown / Overlay */}
+        {/* Search Results */}
         {searchQuery && searchResults.length > 0 && (
           <div className="bg-background/95 backdrop-blur border-b border-border p-4 max-h-64 overflow-y-auto shadow-2xl z-10">
             <div className="text-xs uppercase font-bold text-muted mb-2 tracking-wider">Top Results</div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {searchResults.map(result => (
-                <SearchResultItem 
-                  key={result.note.id} 
-                  result={result} 
+                <SearchResultItem
+                  key={result.note.id}
+                  result={result}
                   onClick={() => {
                     setActiveNoteId(result.note.id);
-                    setSearchQuery(''); // Clear search on select to show content
+                    setSearchQuery('');
                     setSearchResults([]);
                     setViewMode('editor');
-                  }} 
+                  }}
                 />
               ))}
             </div>
@@ -1082,11 +1205,29 @@ const App = () => {
         )}
 
         {/* Workspace */}
-        <div className="flex-1 overflow-y-auto relative">
-           {renderContent()}
-        </div>
-
+        <div className="flex-1 overflow-y-auto relative">{renderContent()}</div>
       </div>
+
+      <ConfirmationModal
+        isOpen={!!moveRequest}
+        title="Reorganize Knowledge"
+        message={
+          <div className="space-y-2">
+            <p>Are you sure you want to move this note?</p>
+            <div className="flex items-center gap-2 p-3 bg-black/20 rounded border border-white/5">
+              <span className="text-gray-400">Note:</span>
+              <span className="font-bold text-white">{moveRequest?.noteTitle}</span>
+            </div>
+            <div className="flex justify-center text-gray-500">↓</div>
+            <div className="flex items-center gap-2 p-3 bg-blue-500/10 rounded border border-blue-500/20">
+              <span className="text-blue-300">New Cluster:</span>
+              <span className="font-bold text-blue-100">{moveRequest?.targetClusterName}</span>
+            </div>
+          </div>
+        }
+        onConfirm={executeMove}
+        onCancel={() => setMoveRequest(null)}
+      />
     </div>
   );
 };
