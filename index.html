@@ -4,28 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Synapse | Intelligent Knowledge Base</title>
+
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
         theme: {
           extend: {
             colors: {
-              background: '#0f1117', // Cursor-like dark bg
-              surface: '#181b25',
-              border: '#2e323e',
-              primary: '#3b82f6',
-              secondary: '#a855f7',
-              text: '#e2e8f0',
-              muted: '#94a3b8'
+              background: "#0f1117", // Cursor-like dark bg
+              surface: "#181b25",
+              border: "#2e323e",
+              primary: "#3b82f6",
+              secondary: "#a855f7",
+              text: "#e2e8f0",
+              muted: "#94a3b8",
             },
             fontFamily: {
-              sans: ['Inter', 'system-ui', 'sans-serif'],
-              mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+              sans: ["Inter", "system-ui", "sans-serif"],
+              mono: ["JetBrains Mono", "Fira Code", "monospace"],
             },
           },
         },
-      }
+      };
     </script>
+
     <style>
       body {
         background-color: #0f1117;
@@ -47,31 +49,38 @@
         background: #475569;
       }
     </style>
-  <script type="importmap">
-{
-  "imports": {
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
-    "react/": "https://aistudiocdn.com/react@^19.2.0/",
-    "react": "https://aistudiocdn.com/react@^19.2.0",
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
-    "d3": "https://aistudiocdn.com/d3@^7.9.0"
-  }
-}
-</script>
-</head>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+          "react/": "https://aistudiocdn.com/react@^19.2.0/",
+          "react": "https://aistudiocdn.com/react@^19.2.0",
+          "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+          "d3": "https://aistudiocdn.com/d3@^7.9.0",
+          "pdfjs-dist": "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs",
+          "mammoth": "https://esm.sh/mammoth@1.8.0"
+        }
+      }
+    </script>
+  </head>
+
   <body>
     <div id="root"></div>
+
+    <!-- Bootstraps your React app -->
     <script type="module" src="/index.tsx"></script>
 
     <script>
-      if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('./service-worker.js')
-            .then(registration => {
-              console.log('SW registered: ', registration);
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("./service-worker.js")
+            .then((registration) => {
+              console.log("SW registered: ", registration);
             })
-            .catch(registrationError => {
-              console.log('SW registration failed: ', registrationError);
+            .catch((registrationError) => {
+              console.log("SW registration failed: ", registrationError);
             });
         });
       }
