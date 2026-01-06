@@ -23,8 +23,8 @@ const processData = (clusters: ClusterNode[]) => {
 
   // Recursively process clusters at any depth
   const processCluster = (cluster: ClusterNode, parentId: string, level: number) => {
-    // Create unique ID for this cluster to avoid collisions
-    const clusterId = `cluster-L${level}-${cluster.id}`;
+    // Create unique ID for this cluster - include parent ID to avoid collisions across domains
+    const clusterId = `cluster-${parentId}-L${level}-${cluster.id}`;
     
     console.log(`  Processing cluster: "${cluster.name}" (id: ${cluster.id}, type: ${cluster.type}, level: ${level}, children: ${cluster.children?.length || 0})`);
     
@@ -52,10 +52,11 @@ const processData = (clusters: ClusterNode[]) => {
     // Process children (can be notes or nested clusters)
     if (cluster.children) {
       console.log(`    Children of "${cluster.name}":`, cluster.children.map(c => `${c.type}:${c.name}`).join(', '));
-      cluster.children.forEach(child => {
+      cluster.children.forEach((child, idx) => {
+        console.log(`      [${idx}] Processing child: type="${child.type}", name="${child.name}", hasChildren=${!!child.children}, childrenCount=${child.children?.length || 0}`);
         if (child.type === 'note') {
-          // Create unique ID for note
-          const noteId = `note-L${level + 1}-${child.noteId || child.id}`;
+          // Create unique ID for note - include parent cluster ID to avoid collisions
+          const noteId = `note-${clusterId}-${child.noteId || child.id}`;
           
           // Skip duplicate notes
           if (seenIds.has(noteId)) {
@@ -75,7 +76,10 @@ const processData = (clusters: ClusterNode[]) => {
           links.push({ source: clusterId, target: noteId, level: level + 1 });
         } else if (child.type === 'cluster') {
           // Nested cluster - recurse with current cluster as parent
+          console.log(`      ➡️ Recursing into cluster: "${child.name}" with ${child.children?.length || 0} children`);
           processCluster(child, clusterId, level + 1);
+        } else {
+          console.warn(`      ⚠️ Unknown child type: "${child.type}" for "${child.name}"`);
         }
       });
     }

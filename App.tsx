@@ -170,31 +170,163 @@ const extractTextFromDocx = async (file: File): Promise<string> => {
 const extractTextFromBinary = async (file: File, noteTitle: string): Promise<string> => {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
-  let result = "";
+  const rawStrings: string[] = [];
   let currentRun = "";
   
-  // Iterate through bytes to find sequences of printable ASCII characters
-  // This mimics the unix 'strings' command
+  // Step 1: Extract all printable ASCII runs (like unix 'strings' command)
   for (let i = 0; i < bytes.length; i++) {
     const code = bytes[i];
     if ((code >= 32 && code <= 126) || code === 10 || code === 13 || code === 9) {
       currentRun += String.fromCharCode(code);
     } else {
-      // If we have a run of 4+ characters, keep it
-      if (currentRun.length >= 4) {
-        result += currentRun + "\n";
+      // Keep runs of 8+ characters (higher threshold to reduce noise)
+      if (currentRun.length >= 8) {
+        rawStrings.push(currentRun.trim());
       }
       currentRun = "";
     }
   }
-  // Add final run
-  if (currentRun.length >= 4) {
-    result += currentRun;
+  if (currentRun.length >= 8) {
+    rawStrings.push(currentRun.trim());
   }
+
+  // Step 2: Filter out junk patterns
+  const junkPatterns = [
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, // GUIDs
+    /^[A-Z]:\\.*$/i,                    // File paths
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/,   // ISO timestamps
+    /^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d/i, // Day dates
+    /^\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)/i, // Date formats
+    /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d/i,
+    /^https?:\/\/schemas\./,             // Schema URLs
+    /^xmlns:/,                           // XML namespaces
+    /^<[^>]+>$/,                         // XML/HTML tags
+    /^[{}[\]]+$/,                        // Just brackets
+    /^Microsoft\./,                      // Microsoft namespaces
+    /^System\./,                         // System namespaces
+    /^Windows\./,                        // Windows namespaces
+    /^onenote:/i,                        // OneNote URIs
+    /^one:/i,                            // OneNote scheme
+    /^\$\(/,                             // Variable references
+    /^[0-9.]+$/,                         // Just numbers
+    /^[A-Z]{2,}[a-z]+[A-Z]/,             // CamelCase identifiers (likely code)
+    /^(Get|Set|Add|Remove|Create|Delete|Update|Insert)[A-Z]/, // Method names
+    /^_[a-zA-Z]/,                        // Private identifiers
+    /Content-Type/i,                     // HTTP headers
+    /^application\//,                    // MIME types
+    /^text\//,                           // MIME types
+    /LastModifiedTime/i,                 // Metadata fields
+    /CreationTime/i,
+    /ObjectID/i,
+    /^Author$/i,
+    /^[=+\-*\/&|!@#$%^]+$/,              // Just operators/symbols
+    /^[A-Za-z0-9~\$]{1,6}$/,             // Short alphanumeric gibberish
+  ];
+
+  const filteredStrings = rawStrings.filter(str => {
+    // Skip empty or very short
+    if (!str || str.length < 5) return false;
+    
+    // Skip if matches junk pattern
+    for (const pattern of junkPatterns) {
+      if (pattern.test(str)) return false;
+    }
+    
+    // Skip if mostly non-alphabetic (likely binary/encoded data)
+    const alphaCount = (str.match(/[a-zA-Z]/g) || []).length;
+    if (alphaCount / str.length < 0.5) return false;
+    
+    // Skip if looks like base64 or encoded data
+    if (/^[A-Za-z0-9+/=]{20,}$/.test(str)) return false;
+    
+    // Skip if has too many special characters mixed in
+    const specialCount = (str.match(/[~\$\^@#%&\*\[\]{}\\|]/g) || []).length;
+    if (specialCount > 2) return false;
+    
+    return true;
+  });
+
+  // Step 3: Find content related to the note title
+  const titleLower = noteTitle.toLowerCase();
+  
+  // Find the LAST occurrence of the title (most recent version)
+  let titleIndex = -1;
+  for (let i = filteredStrings.length - 1; i >= 0; i--) {
+    const strLower = filteredStrings[i].toLowerCase();
+    if (strLower === titleLower || strLower.includes(titleLower)) {
+      titleIndex = i;
+      break;
+    }
+  }
+
+  // Step 4: Extract content after the title
+  let contentStrings: string[];
+  if (titleIndex >= 0) {
+    // Take content after title (skip the title itself), limit amount
+    contentStrings = filteredStrings.slice(titleIndex + 1, titleIndex + 50);
+  } else {
+    // No title match - take last portion (most recent content)
+    contentStrings = filteredStrings.slice(-30);
+  }
+
+  // Step 5: Global deduplication - remove all duplicates, not just consecutive
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const str of contentStrings) {
+    const normalized = str.toLowerCase().trim();
+    // Also skip if it's the note title
+    if (normalized === titleLower) continue;
+    // Skip duplicates
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(str);
+  }
+
+  // Step 6: Stop if we hit another note's apparent title (repeated header pattern)
+  const finalContent: string[] = [];
+  for (const str of deduped) {
+    // If this line looks like a title (appears multiple times in original), stop
+    const occurrences = filteredStrings.filter(s => s.toLowerCase() === str.toLowerCase()).length;
+    if (occurrences > 2 && str.length < 50) {
+      // Likely a repeated section header or another note title - stop here
+      break;
+    }
+    finalContent.push(str);
+  }
+
+  const result = finalContent.join('\n\n');
   
   return result.length > 0 
     ? result 
     : "Binary content detected but no readable text could be extracted.";
+};
+
+// Helper: Recursively remove a note from cluster hierarchy
+const removeNoteFromClusters = (clusters: ClusterNode[], noteId: string): ClusterNode[] => {
+  return clusters.map(cluster => {
+    if (!cluster.children) return cluster;
+    
+    // Filter out the note and recursively process nested clusters
+    const filteredChildren = cluster.children
+      .filter(child => !(child.type === 'note' && child.noteId === noteId))
+      .map(child => {
+        if (child.type === 'cluster') {
+          const updatedChildren = removeNoteFromClusters([child], noteId);
+          return updatedChildren[0];
+        }
+        return child;
+      });
+    
+    return { ...cluster, children: filteredChildren };
+  }).filter(cluster => {
+    // Remove empty clusters
+    if (!cluster.children || cluster.children.length === 0) return false;
+    // Keep clusters that have notes or non-empty subclusters
+    return cluster.children.some(c => 
+      c.type === 'note' || 
+      (c.type === 'cluster' && c.children && c.children.length > 0)
+    );
+  });
 };
 
 // --- Helper Component: Search Result Item ---
@@ -682,10 +814,11 @@ const App = () => {
         await bulkSaveNotes(newNotes);
         setNotes(prev => [...prev, ...newNotes]);
         setExpandedFolders(prev => new Set(prev).add('/uploads'));
-        // Reset clustering
-        if (hasClustered) {
-          setHasClustered(false);
-          setClusters([]);
+        
+        // If already clustered, trigger incremental clustering instead of resetting
+        if (hasClustered && clusters.length > 0) {
+          console.log('📝 New notes imported, will update clusters incrementally when graph is viewed');
+          // Don't reset - the next View Graph click will trigger incrementalCluster
         }
       }
     } catch (error) {
@@ -711,9 +844,10 @@ const App = () => {
     setViewMode('editor');
     setExpandedFolders(prev => new Set(prev).add('/drafts'));
     
-    if (hasClustered) {
-        setHasClustered(false);
-        setClusters([]);
+    // If already clustered, log that incremental update will happen on next graph view
+    if (hasClustered && clusters.length > 0) {
+      console.log('📝 New note created, will update clusters incrementally when graph is viewed');
+      // Don't reset - the next View Graph click will trigger incrementalCluster
     }
 
     try {
@@ -812,9 +946,10 @@ const App = () => {
         if (activeNoteId === id) {
             setActiveNoteId(null);
         }
-        if (hasClustered) {
-            setHasClustered(false);
-            setClusters([]);
+        
+        // Remove note from clusters instead of resetting everything
+        if (hasClustered && clusters.length > 0) {
+          setClusters(prev => removeNoteFromClusters(prev, id));
         }
 
       try {
